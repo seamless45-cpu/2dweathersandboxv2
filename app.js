@@ -1057,6 +1057,9 @@ function beginStationSampleBatch()
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
+  if (!entries.length)
+    return false; // nothing servable: every station reads the GPU directly
+
   stationSamples.pending = true;
   stationSamples.frames = 0;
   stationSamples.entries = entries;
@@ -30582,6 +30585,12 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
         + '  VQ ' + vqSun.toFixed(2) + '/' + vqReal.toFixed(2),
       'Pressure: ' + pressure.toFixed(2) + '  lite=' + (lite ? 'on' : 'off')
         + '  hiResPerf=' + (guiControls.highResPerformanceMode ? 'on' : 'off'),
+      'GL calls: ' + glStateStats.lastFrameCalls + '/frame  cached '
+        + glStateStats.lastFrameSkipped + ' ('
+        + (glStateStats.lastFrameCalls + glStateStats.lastFrameSkipped > 0
+          ? Math.round(100 * glStateStats.lastFrameSkipped
+            / (glStateStats.lastFrameCalls + glStateStats.lastFrameSkipped))
+          : 0) + '% skipped)',
       'Paused: ' + (guiControls.paused ? 'yes' : 'no')
         + '  precip=' + (guiControls.enablePrecipitation ? 'on' : 'off')
         + '  bloom=' + (guiControls.enableBloom ? 'on' : 'off'),
