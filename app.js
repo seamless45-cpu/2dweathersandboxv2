@@ -1343,7 +1343,9 @@ var dryLapse;
 const timePerIteration = 0.00008; // in hours (0.00008 = 0.288 sec, at 40m cell size that means the speed of light & sound = 138.88 m/s = 500 km/h)
 const REALTIME_ITERS_PER_MS = 1.0 / (timePerIteration * 3600 * 1000); // iterations per real ms at 1:1 sim speed
 const REALTIME_MAX_CATCHUP_MS = 500; // cap lag catch-up so a long stall does not burst the sim forward
-// Must match shaders: uniform vec4 initial_Tv[126] and sounding profiles (126*4).
+// Column profile length for soundings / initial temperature. 504 = 126 vec4, which is the
+// array size the shaders that still take profiles as uniforms use (vec4 x[126]); the
+// advection shader samples them from soundingProfileTexture instead.
 const SIM_PROFILE_SAMPLES = 504;
 const TARGET_FRAME_MS = 28;
 
@@ -10431,6 +10433,44 @@ var realWorldSounding_W;
 var realWorldSounding_Vel;
 var customSoundingLoaded = false;
 
+// The advection shader reads its four column profiles (initial T + sounding T/W/vel) from a
+// single SIM_PROFILE_SAMPLES x 1 RGBA32F texture instead of uniform arrays: as uniforms they
+// needed 4 * 126 = 504 uniform vectors, which exceeds the WebGL2 fragment uniform limit
+// (256 vectors on many GPUs) and made advectionProgram fail to link.
+// Texel layout: R = initial potential T, G = sounding potential T, B = sounding vapor, A = sounding velocity.
+const SOUNDING_PROFILE_UNIT_ADV = 4; // advection samplers 0..3 are base/water/wall/smoke
+var soundingProfileTexture = null;
+var soundingProfilePixels = new Float32Array(SIM_PROFILE_SAMPLES * 4);
+var initialTProfileCpu = null; // latest initial_T column; set while the sim builds its profiles
+
+/** Creates/updates the profile texture sampled by advectionShader.frag. */
+function uploadSoundingProfileTexture()
+{
+  if (typeof gl === 'undefined' || !gl || !initialTProfileCpu)
+    return;
+  const n = SIM_PROFILE_SAMPLES;
+  const data = soundingProfilePixels;
+  for (let i = 0; i < n; i++) {
+    data[i * 4 + 0] = initialTProfileCpu[i];
+    data[i * 4 + 1] = realWorldSounding_T ? realWorldSounding_T[i] : 0;
+    data[i * 4 + 2] = realWorldSounding_W ? realWorldSounding_W[i] : 0;
+    data[i * 4 + 3] = realWorldSounding_Vel ? realWorldSounding_Vel[i] : 0;
+  }
+  const prevBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
+  if (!soundingProfileTexture) {
+    soundingProfileTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, soundingProfileTexture);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, n, 1);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+  gl.bindTexture(gl.TEXTURE_2D, soundingProfileTexture);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, n, 1, gl.RGBA, gl.FLOAT, data);
+  gl.bindTexture(gl.TEXTURE_2D, prevBinding);
+}
+
 function saveSoundingToFile()
 {
   if (!soundingData || soundingData.length === 0) {
@@ -10533,10 +10573,7 @@ function updateSoundingUniforms()
     return s && Number.isFinite(s.vel) ? s.vel : 0.01;
   });
   
-  gl.useProgram(advectionProgram);
-  gl.uniform4fv(gl.getUniformLocation(advectionProgram, 'realWorldSounding_Tv'), realWorldSounding_T);
-  gl.uniform4fv(gl.getUniformLocation(advectionProgram, 'realWorldSounding_Wv'), realWorldSounding_W);
-  gl.uniform4fv(gl.getUniformLocation(advectionProgram, 'realWorldSounding_Velv'), realWorldSounding_Vel);
+  uploadSoundingProfileTexture();
 }
 
 function updateSoundingPreview(soundingData)
@@ -21701,7 +21738,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
   // load shaders
-  const SHADER_ASSET_VERSION = 98; // bump to bust CDN/browser cache after shader edits
+  const SHADER_ASSET_VERSION = 99; // bump to bust CDN/browser cache after shader edits
 
   var commonSource = await loadSourceFile('shaders/common.glsl');
   var commonDisplaySource = await loadSourceFile('shaders/commonDisplay.glsl');
@@ -25510,6 +25547,9 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
 
   buildReferencePressureProfile(initial_T);
   uploadRefProfileTexture();
+  // Advection samples these profiles from a texture (see uploadSoundingProfileTexture).
+  initialTProfileCpu = initial_T;
+  uploadSoundingProfileTexture();
   setupPressureRowMeanTarget();
 
   // Set constant uniforms
@@ -25570,17 +25610,15 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   gl.uniform2f(gl.getUniformLocation(advectionProgram, 'resolution'), sim_res_x, sim_res_y);
   // gl.uniform1fv(
   // gl.getUniformLocation(advectionProgram, 'initial_T'), initial_T);
-  gl.uniform4fv(gl.getUniformLocation(advectionProgram, 'initial_Tv'), initial_T);
+  // initial_Tv / realWorldSounding_*v are a single float texture now, not uniform arrays:
+  // 4 * 126 uniform vectors would exceed the fragment uniform limit.
+  gl.uniform1i(gl.getUniformLocation(advectionProgram, 'soundingProfileTex'), SOUNDING_PROFILE_UNIT_ADV);
   gl.uniform1f(gl.getUniformLocation(advectionProgram, 'dryLapse'), dryLapse);
   gl.uniform1f(gl.getUniformLocation(advectionProgram, 'waterTemperature'),
                CtoK(guiControls.waterTemperature)); // can be changed by GUI input
   gl.uniform1f(gl.getUniformLocation(advectionProgram, 'maxWaterTemperatureC'), guiControls.maxWaterTemperatureC);
   gl.uniform1f(gl.getUniformLocation(advectionProgram, 'enableGlacierFormation'), guiControls.enableGlacierFormation ? 1.0 : 0.0);
   gl.uniform1i(gl.getUniformLocation(advectionProgram, 'allowCaves'), guiControls.allowCaves ? 1 : 0);
-
-  gl.uniform4fv(gl.getUniformLocation(advectionProgram, 'realWorldSounding_Tv'), realWorldSounding_T);
-  gl.uniform4fv(gl.getUniformLocation(advectionProgram, 'realWorldSounding_Wv'), realWorldSounding_W);
-  gl.uniform4fv(gl.getUniformLocation(advectionProgram, 'realWorldSounding_Velv'), realWorldSounding_Vel);
 
   gl.useProgram(pressureProgram);
   gl.uniform1i(gl.getUniformLocation(pressureProgram, 'baseTex'), 0);
@@ -26281,6 +26319,26 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       gl.activeTexture(gl.TEXTURE0 + i);
       gl.bindTexture(gl.TEXTURE_2D, null);
     }
+  }
+
+  /**
+   * Binds the advection samplers: 0 base, 1 water, 2 wall, 3 smoke, 4 sounding profiles.
+   * The sounding profiles live in a texture (not uniform arrays) so the fragment shader
+   * stays inside the WebGL2 uniform-vector limit.
+   */
+  function bindAdvectionTextures(baseTex, waterTex, wallTex, smokeTex)
+  {
+    // Profiles first so the active unit ends on TEXTURE3, as the inline binds used to.
+    gl.activeTexture(gl.TEXTURE0 + SOUNDING_PROFILE_UNIT_ADV);
+    gl.bindTexture(gl.TEXTURE_2D, soundingProfileTexture);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, baseTex);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, waterTex);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, wallTex);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, smokeTex);
   }
 
   function unbindSunColumnFromSamplers()
@@ -30346,14 +30404,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       if (uloc_adv_brushOnlyMode)
         gl.uniform1i(uloc_adv_brushOnlyMode, 1);
       gl.uniform1f(uloc_adv_iterNum, iterNum);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, baseTexture_0);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, waterTexture_0);
-      gl.activeTexture(gl.TEXTURE2);
-      gl.bindTexture(gl.TEXTURE_2D, wallTexture_0);
-      gl.activeTexture(gl.TEXTURE3);
-      gl.bindTexture(gl.TEXTURE_2D, smokeTexture_0);
+      bindAdvectionTextures(baseTexture_0, waterTexture_0, wallTexture_0, smokeTexture_0);
       gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_1);
       gl.drawBuffers([ gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3 ]);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -30427,14 +30478,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       if (uloc_adv_brushOnlyMode)
         gl.uniform1i(uloc_adv_brushOnlyMode, 1);
       gl.uniform1f(uloc_adv_iterNum, iterNum);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, baseTexture_1);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, waterTexture_1);
-      gl.activeTexture(gl.TEXTURE2);
-      gl.bindTexture(gl.TEXTURE_2D, wallTexture_1);
-      gl.activeTexture(gl.TEXTURE3);
-      gl.bindTexture(gl.TEXTURE_2D, smokeTexture_1);
+      bindAdvectionTextures(baseTexture_1, waterTexture_1, wallTexture_1, smokeTexture_1);
       gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_0);
       gl.drawBuffers([ gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3 ]);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -31273,14 +31317,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
 
     gl.useProgram(advectionProgram);
     gl.uniform1f(uloc_adv_iterNum, iterNum);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, baseTexture_0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, waterTexture_0);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, wallTexture_0);
-    gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, smokeTexture_0);
+    bindAdvectionTextures(baseTexture_0, waterTexture_0, wallTexture_0, smokeTexture_0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_1);
     gl.drawBuffers([ gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3 ]);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -31319,14 +31356,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     if (uloc_adv_brushOnlyMode)
       gl.uniform1i(uloc_adv_brushOnlyMode, 1);
     gl.uniform1f(uloc_adv_iterNum, iterNum);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, baseTexture_0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, waterTexture_0);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, wallTexture_0);
-    gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, smokeTexture_0);
+    bindAdvectionTextures(baseTexture_0, waterTexture_0, wallTexture_0, smokeTexture_0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_1);
     gl.drawBuffers([ gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3 ]);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -32337,14 +32367,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
                 gl.uniform1i(uloc_adv_userInputType, -1);
               if (uloc_adv_userInputSettlementVariant)
                 gl.uniform1i(uloc_adv_userInputSettlementVariant, currentSettlementVariant(guiControls.tool));
-              gl.activeTexture(gl.TEXTURE0);
-              gl.bindTexture(gl.TEXTURE_2D, baseTexture_0);
-              gl.activeTexture(gl.TEXTURE1);
-              gl.bindTexture(gl.TEXTURE_2D, waterTexture_0);
-              gl.activeTexture(gl.TEXTURE2);
-              gl.bindTexture(gl.TEXTURE_2D, wallTexture_0);
-              gl.activeTexture(gl.TEXTURE3);
-              gl.bindTexture(gl.TEXTURE_2D, smokeTexture_0);
+              bindAdvectionTextures(baseTexture_0, waterTexture_0, wallTexture_0, smokeTexture_0);
               gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_1);
               gl.drawBuffers([ gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3 ]);
               gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

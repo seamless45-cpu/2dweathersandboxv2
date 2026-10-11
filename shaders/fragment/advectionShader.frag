@@ -62,35 +62,38 @@ uniform vec2 resolution;
 
 vec2 texelSize;
 
-uniform vec4 initial_Tv[126];
-uniform vec4 realWorldSounding_Tv[126];
-uniform vec4 realWorldSounding_Wv[126];
-uniform vec4 realWorldSounding_Velv[126];
+// Sounding profiles (SIM_PROFILE_SAMPLES texels, one sample per texel):
+//   R = initial potential temperature, G = sounding potential temperature,
+//   B = sounding water vapor,          A = sounding wind velocity.
+// These used to be four vec4[126] uniforms (504 uniform vectors), which is far past the
+// WebGL2 fragment uniform limit (MAX_FRAGMENT_UNIFORM_VECTORS, 256 on many drivers) and
+// made the program fail to link. A NEAREST float texture costs no uniform vectors.
+uniform sampler2D soundingProfileTex;
 
 #include "common.glsl"
 
 float getInitialT(int y)
 {
   int i = simProfileIndex(y, resolution.y);
-  return initial_Tv[i / 4][i % 4];
+  return texelFetch(soundingProfileTex, ivec2(i, 0), 0).r;
 }
 float getRealWorldSounding_T(int y)
 {
   int i0 = simProfileIndex(max(y - 1, 0), resolution.y);
   int i1 = simProfileIndex(y, resolution.y);
-  return (realWorldSounding_Tv[i1 / 4][i1 % 4] + realWorldSounding_Tv[i0 / 4][i0 % 4]) / 2.;
+  return (texelFetch(soundingProfileTex, ivec2(i1, 0), 0).g + texelFetch(soundingProfileTex, ivec2(i0, 0), 0).g) / 2.;
 }
 float getRealWorldSounding_W(int y)
 {
   int i0 = simProfileIndex(max(y - 1, 0), resolution.y);
   int i1 = simProfileIndex(y, resolution.y);
-  return (realWorldSounding_Wv[i1 / 4][i1 % 4] + realWorldSounding_Wv[i0 / 4][i0 % 4]) / 2.;
+  return (texelFetch(soundingProfileTex, ivec2(i1, 0), 0).b + texelFetch(soundingProfileTex, ivec2(i0, 0), 0).b) / 2.;
 }
 float getRealWorldSounding_Vel(int y)
 {
   int i0 = simProfileIndex(max(y - 1, 0), resolution.y);
   int i1 = simProfileIndex(y, resolution.y);
-  return (realWorldSounding_Velv[i1 / 4][i1 % 4] + realWorldSounding_Velv[i0 / 4][i0 % 4]) / 2.;
+  return (texelFetch(soundingProfileTex, ivec2(i1, 0), 0).a + texelFetch(soundingProfileTex, ivec2(i0, 0), 0).a) / 2.;
 }
 
 void main()

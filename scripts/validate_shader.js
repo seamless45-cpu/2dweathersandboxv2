@@ -58,18 +58,80 @@ function toSpirvCompatibleEs(src)
   }).join('\n');
 }
 
-const glslang = require('@webgpu/glslang')();
-const shaders = process.argv.length > 2 ? process.argv.slice(2) : DEFAULT_SHADERS;
-let failed = 0;
-for (const name of shaders) {
-  const stage = name.endsWith('.vert') ? 'vertex' : 'fragment';
-  const src = toSpirvCompatibleEs(expandIncludes(fs.readFileSync(path.join(root, 'shaders', stage, name), 'utf8')));
-  try {
-    glslang.compileGLSL(src, stage, false);
-    console.log('VALID  ' + name);
-  } catch (e) {
-    failed++;
-    console.error('ERROR  ' + name + ': ' + e.message);
+// Uniform storage budget, which glslang cannot see: GLSL ES spends one "uniform vector" (vec4)
+// slot per float/int/bool/vec2..vec4, two for mat2, three for mat3, four for mat4, times the
+// array length; samplers are opaque and cost none. WebGL2 only guarantees 224 vectors
+// (MAX_FRAGMENT_UNIFORM_VECTORS) and 256 is the common ANGLE/D3D11 cap, so a shader over that
+// fails to link even though it compiles — exactly how the advection shader's four vec4[126]
+// profile arrays broke.
+const UNIFORM_VECTORS_FAIL_ABOVE = 256;
+const UNIFORM_VECTORS_WARN_ABOVE = 224;
+const UNIFORM_BASE_VECTORS = {
+  float : 1, int : 1, uint : 1, bool : 1,
+  vec2 : 1, vec3 : 1, vec4 : 1,
+  ivec2 : 1, ivec3 : 1, ivec4 : 1,
+  uvec2 : 1, uvec3 : 1, uvec4 : 1,
+  bvec2 : 1, bvec3 : 1, bvec4 : 1,
+  mat2 : 2, mat3 : 3, mat4 : 4,
+};
+
+function uniformVectorCost(src)
+{
+  let vectors = 0, samplers = 0;
+  const re = /^\s*uniform\s+(?:(?:highp|mediump|lowp)\s+)?(\w+)\s+([^;]+);/;
+  for (const line of src.split(/\r?\n/)) {
+    const m = re.exec(line);
+    if (!m)
+      continue;
+    if (/^sampler/.test(m[1])) {
+      samplers++;
+      continue;
+    }
+    const base = UNIFORM_BASE_VECTORS[m[1]];
+    if (!base)
+      continue; // opaque or struct type: not budgeted here
+    const am = /\[(\d+)\]/.exec(m[2]);
+    vectors += base * (am ? parseInt(am[1], 10) : 1);
   }
+  return { vectors, samplers };
 }
-process.exitCode = failed ? 1 : 0;
+
+function validateShader(name)
+{
+  const stage = name.endsWith('.vert') ? 'vertex' : 'fragment';
+  const expanded = expandIncludes(fs.readFileSync(path.join(root, 'shaders', stage, name), 'utf8'));
+  const src = toSpirvCompatibleEs(expanded);
+  const cost = uniformVectorCost(expanded);
+  const glslang = require('@webgpu/glslang')();
+  glslang.compileGLSL(src, stage, false);
+  return cost;
+}
+
+module.exports = {
+  expandIncludes, toSpirvCompatibleEs, uniformVectorCost, validateShader,
+  DEFAULT_SHADERS, UNIFORM_VECTORS_FAIL_ABOVE, UNIFORM_VECTORS_WARN_ABOVE,
+};
+
+if (require.main === module) {
+  const shaders = process.argv.length > 2 ? process.argv.slice(2) : DEFAULT_SHADERS;
+  let failed = 0;
+  for (const name of shaders) {
+    try {
+      const cost = validateShader(name);
+      let line = 'VALID  ' + name + '  (' + cost.vectors + ' uniform vectors, ' + cost.samplers + ' samplers)';
+      if (cost.vectors > UNIFORM_VECTORS_FAIL_ABOVE) {
+        failed++;
+        console.error(line + '\nERROR  ' + name + ': ' + cost.vectors + ' uniform vectors exceeds the WebGL2 fragment limit of ' + UNIFORM_VECTORS_FAIL_ABOVE
+          + ' — move large uniform arrays into a texture (see soundingProfileTex / refProfileTex).');
+        continue;
+      }
+      if (cost.vectors > UNIFORM_VECTORS_WARN_ABOVE)
+        line += '  WARNING: above the WebGL2 guaranteed minimum of ' + UNIFORM_VECTORS_WARN_ABOVE + ' vectors; low-end drivers may refuse to link';
+      console.log(line);
+    } catch (e) {
+      failed++;
+      console.error('ERROR  ' + name + ': ' + e.message);
+    }
+  }
+  process.exitCode = failed ? 1 : 0;
+}
