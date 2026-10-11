@@ -949,6 +949,417 @@ function cpuPatchScratchView(key, Type, len)
   return buf.subarray(0, len);
 }
 
+// ---------------------------------------------------------------------------
+// GL state cache
+// ---------------------------------------------------------------------------
+// The render loop issues thousands of state-setting calls per frame (useProgram,
+// activeTexture, bindTexture, bindFramebuffer, drawBuffers, viewport, uniform*). Most repeat
+// the value that is already current, and every call costs JS, argument validation and driver
+// command processing before the GPU even sees work. installGlStateCache() replaces those
+// methods on the context object with wrappers that skip a call when it would set the state it
+// already has. The wrappers only ever *skip* redundant calls — they never report state that
+// differs from what the GPU has, and getParameter() is never intercepted, so any code that
+// reads state back still sees the truth. delete*/linkProgram invalidate cached entries.
+var glStateStats = {
+  calls : 0, skipped : 0,           // current frame
+  lastFrameCalls : 0, lastFrameSkipped : 0,
+  skipping : true,                  // toggled off for A/B measurement
+};
+
+function beginGlStateFrameStats()
+{
+  glStateStats.lastFrameCalls = glStateStats.calls;
+  glStateStats.lastFrameSkipped = glStateStats.skipped;
+  glStateStats.calls = 0;
+  glStateStats.skipped = 0;
+}
+
+function installGlStateCache(ctx)
+{
+  if (!ctx || ctx.__glStateCacheInstalled)
+    return;
+  ctx.__glStateCacheInstalled = true;
+
+  // Deleting an object makes drivers drop it from any binding it was in (spec behaviour), but
+  // the cache cannot assume that shape, so deleted entries are marked unknown and the next
+  // call for them is always applied.
+  const UNKNOWN = { unknown : true };
+  const cache = {
+    program : null,
+    programValid : false,
+    activeUnit : ctx.TEXTURE0,
+    texUnits : null,
+    fbDraw : null,
+    fbRead : null,
+    // Draw/read buffer state belongs to the framebuffer object (ES 3.0 §9.4.1), so it is
+    // cached per framebuffer rather than as one global value.
+    drawBuffersByFbo : new Map(),
+    readBufferByFbo : new Map(),
+    vao : null,
+    buffers : new Map(),
+    tf : new Map(),
+    renderbuffer : new Map(),
+    viewport : [ -1, -1, -1, -1 ],
+    caps : new Map(),
+    blendFunc : null,
+    blendEquation : null,
+  };
+  const UNITS = Math.max(8, Math.min(64, ctx.getParameter(ctx.MAX_COMBINED_TEXTURE_IMAGE_UNITS) || 32));
+  cache.texUnits = new Array(UNITS);
+  for (let i = 0; i < UNITS; i++)
+    cache.texUnits[i] = Object.create(null);
+
+  const skip = () => { glStateStats.skipped++; };
+  const count = () => { glStateStats.calls++; };
+  const statsOn = () => glStateStats.skipping;
+
+  function unitSlot(unit)
+  {
+    const idx = unit - ctx.TEXTURE0;
+    if (idx < 0 || idx >= UNITS)
+      return null;
+    return cache.texUnits[idx];
+  }
+
+  // ---- program / shader binding -------------------------------------------------
+  const origUseProgram = ctx.useProgram;
+  ctx.useProgram = function(program)
+  {
+    if (cache.programValid && cache.program === program) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origUseProgram.call(ctx, program);
+    cache.program = program;
+    cache.programValid = true;
+  };
+
+  // ---- texture units ------------------------------------------------------------
+  const origActiveTexture = ctx.activeTexture;
+  ctx.activeTexture = function(unit)
+  {
+    if (cache.activeUnit === unit && unitSlot(unit)) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origActiveTexture.call(ctx, unit);
+    cache.activeUnit = unit;
+  };
+
+  const origBindTexture = ctx.bindTexture;
+  ctx.bindTexture = function(target, texture)
+  {
+    const slot = unitSlot(cache.activeUnit);
+    if (slot) {
+      const key = target === ctx.TEXTURE_CUBE_MAP ? 'cube' : '2d';
+      if (slot[key] === texture) { if (statsOn()) skip(); return; }
+      if (statsOn()) count();
+      origBindTexture.call(ctx, target, texture);
+      slot[key] = texture;
+      return;
+    }
+    if (statsOn()) count();
+    origBindTexture.call(ctx, target, texture);
+  };
+
+  // ---- framebuffers -------------------------------------------------------------
+  const origBindFramebuffer = ctx.bindFramebuffer;
+  ctx.bindFramebuffer = function(target, framebuffer)
+  {
+    if (target === ctx.FRAMEBUFFER) {
+      if (cache.fbDraw === framebuffer && cache.fbRead === framebuffer) { if (statsOn()) skip(); return; }
+      if (statsOn()) count();
+      origBindFramebuffer.call(ctx, target, framebuffer);
+      cache.fbDraw = framebuffer;
+      cache.fbRead = framebuffer;
+      return;
+    }
+    if (target === ctx.DRAW_FRAMEBUFFER) {
+      if (cache.fbDraw === framebuffer) { if (statsOn()) skip(); return; }
+      if (statsOn()) count();
+      origBindFramebuffer.call(ctx, target, framebuffer);
+      cache.fbDraw = framebuffer;
+      return;
+    }
+    if (target === ctx.READ_FRAMEBUFFER) {
+      if (cache.fbRead === framebuffer) { if (statsOn()) skip(); return; }
+      if (statsOn()) count();
+      origBindFramebuffer.call(ctx, target, framebuffer);
+      cache.fbRead = framebuffer;
+      return;
+    }
+    if (statsOn()) count();
+    origBindFramebuffer.call(ctx, target, framebuffer);
+  };
+
+  const origDrawBuffers = ctx.drawBuffers;
+  ctx.drawBuffers = function(buffers)
+  {
+    const fbo = cache.fbDraw; // draw buffer state is stored per draw framebuffer
+    let key = buffers.length;
+    for (let i = 0; i < buffers.length; i++)
+      key = key * 31 + (buffers[i] | 0);
+    key = '' + key;
+    const prev = cache.drawBuffersByFbo.get(fbo);
+    if (prev === key) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origDrawBuffers.call(ctx, buffers);
+    cache.drawBuffersByFbo.set(fbo, key);
+  };
+
+  const origReadBuffer = ctx.readBuffer;
+  ctx.readBuffer = function(mode)
+  {
+    const fbo = cache.fbRead;
+    if (cache.readBufferByFbo.get(fbo) === mode) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origReadBuffer.call(ctx, mode);
+    cache.readBufferByFbo.set(fbo, mode);
+  };
+
+  const origBindRenderbuffer = ctx.bindRenderbuffer;
+  ctx.bindRenderbuffer = function(target, renderbuffer)
+  {
+    if (cache.renderbuffer.get(target) === renderbuffer) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origBindRenderbuffer.call(ctx, target, renderbuffer);
+    cache.renderbuffer.set(target, renderbuffer);
+  };
+
+  // ---- vertex arrays / buffers --------------------------------------------------
+  const origBindVertexArray = ctx.bindVertexArray;
+  ctx.bindVertexArray = function(vao)
+  {
+    if (cache.vao === vao) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origBindVertexArray.call(ctx, vao);
+    cache.vao = vao;
+  };
+
+  const origBindBuffer = ctx.bindBuffer;
+  ctx.bindBuffer = function(target, buffer)
+  {
+    if (cache.buffers.get(target) === buffer) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origBindBuffer.call(ctx, target, buffer);
+    cache.buffers.set(target, buffer);
+  };
+
+  const origBindTransformFeedback = ctx.bindTransformFeedback;
+  ctx.bindTransformFeedback = function(target, tf)
+  {
+    if (cache.tf.get(target) === tf) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origBindTransformFeedback.call(ctx, target, tf);
+    cache.tf.set(target, tf);
+  };
+
+  // ---- viewport / fixed function state ------------------------------------------
+  const origViewport = ctx.viewport;
+  ctx.viewport = function(x, y, w, h)
+  {
+    const v = cache.viewport;
+    if (v[0] === x && v[1] === y && v[2] === w && v[3] === h) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origViewport.call(ctx, x, y, w, h);
+    v[0] = x; v[1] = y; v[2] = w; v[3] = h;
+  };
+
+  const origEnable = ctx.enable;
+  ctx.enable = function(cap)
+  {
+    if (cache.caps.get(cap) === true) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origEnable.call(ctx, cap);
+    cache.caps.set(cap, true);
+  };
+
+  const origDisable = ctx.disable;
+  ctx.disable = function(cap)
+  {
+    if (cache.caps.get(cap) === false) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origDisable.call(ctx, cap);
+    cache.caps.set(cap, false);
+  };
+
+  const origBlendFunc = ctx.blendFunc;
+  ctx.blendFunc = function(src, dst)
+  {
+    const key = src + ',' + dst;
+    if (cache.blendFunc === key) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origBlendFunc.call(ctx, src, dst);
+    cache.blendFunc = key;
+  };
+
+  const origBlendEquation = ctx.blendEquation;
+  ctx.blendEquation = function(mode)
+  {
+    if (cache.blendEquation === mode) { if (statsOn()) skip(); return; }
+    if (statsOn()) count();
+    origBlendEquation.call(ctx, mode);
+    cache.blendEquation = mode;
+  };
+
+  // ---- uniforms -----------------------------------------------------------------
+  // Uniform values are per program; a location object belongs to exactly one program, so
+  // keying the cached value by location is safe. The program that was current when the value
+  // was sent is recorded too, so a value set while another program was bound is never
+  // mistaken for current.
+  const uniformCache = new Map();
+
+  // Array uniforms (uniform4fv and friends) are compared element-wise: callers such as the
+  // synoptic-system pack reuse one Float32Array and mutate it in place, so comparing the
+  // reference would wrongly skip a real update.
+  function uniformArgsMatch(entry, args)
+  {
+    if (entry.argCount !== args.length)
+      return false;
+    if (entry.arrayValues) {
+      const arr = args[args.length - 1];
+      const v = entry.arrayValues;
+      if (!arr || arr.length !== v.length)
+        return false;
+      for (let i = 0; i < v.length; i++) {
+        if (v[i] !== arr[i])
+          return false;
+      }
+      return true;
+    }
+    for (let i = 1; i < args.length; i++) {
+      if (entry.vals[i - 1] !== args[i])
+        return false;
+    }
+    return true;
+  }
+
+  function uniformArgsStore(entry, args, isArray)
+  {
+    entry.argCount = args.length;
+    if (isArray) {
+      const arr = args[args.length - 1];
+      const n = arr ? arr.length : 0;
+      if (!entry.arrayValues || entry.arrayValues.length !== n)
+        entry.arrayValues = new Array(n);
+      for (let i = 0; i < n; i++)
+        entry.arrayValues[i] = arr[i];
+      entry.vals = null;
+      return;
+    }
+    entry.arrayValues = null;
+    const n = args.length - 1;
+    if (!entry.vals || entry.vals.length < n)
+      entry.vals = new Array(n);
+    for (let i = 1; i < args.length; i++)
+      entry.vals[i - 1] = args[i];
+  }
+
+  function makeUniformWrapper(name, isArray)
+  {
+    const origFn = ctx[name];
+    if (typeof origFn !== 'function')
+      return;
+    ctx[name] = function(loc)
+    {
+      const currentProgram = cache.program;
+      if (loc != null) {
+        const entry = uniformCache.get(loc);
+        if (entry && entry.program === currentProgram && uniformArgsMatch(entry, arguments)) {
+          if (statsOn()) skip();
+          return;
+        }
+      }
+      if (statsOn()) count();
+      origFn.apply(ctx, arguments);
+      if (loc != null && cache.programValid) {
+        let entry = uniformCache.get(loc);
+        if (!entry || entry.program !== currentProgram) {
+          entry = { program : currentProgram, argCount : -1, vals : null, arrayValues : null };
+          uniformCache.set(loc, entry);
+        }
+        uniformArgsStore(entry, arguments, isArray);
+      }
+    };
+  }
+
+  [
+    'uniform1f', 'uniform1i', 'uniform1ui', 'uniform2f', 'uniform2i', 'uniform2ui',
+    'uniform3f', 'uniform3i', 'uniform3ui', 'uniform4f', 'uniform4i', 'uniform4ui',
+  ].forEach(function(name) { makeUniformWrapper(name, false); });
+
+  [
+    'uniform1fv', 'uniform1iv', 'uniform1uiv', 'uniform2fv', 'uniform2iv', 'uniform2uiv',
+    'uniform3fv', 'uniform3iv', 'uniform3uiv', 'uniform4fv', 'uniform4iv', 'uniform4uiv',
+  ].forEach(function(name) { makeUniformWrapper(name, true); });
+
+
+  // ---- invalidation -------------------------------------------------------------
+  const origDeleteProgram = ctx.deleteProgram;
+  ctx.deleteProgram = function(program)
+  {
+    if (cache.program === program)
+      cache.programValid = false;
+    uniformCache.clear(); // locations die with the program; cheap and rare
+    if (statsOn()) count();
+    origDeleteProgram.call(ctx, program);
+  };
+
+  const origLinkProgram = ctx.linkProgram;
+  ctx.linkProgram = function(program)
+  {
+    // Linking resets every uniform in the program to 0, so cached values no longer apply.
+    uniformCache.clear();
+    if (statsOn()) count();
+    origLinkProgram.call(ctx, program);
+  };
+
+  const origDeleteTexture = ctx.deleteTexture;
+  ctx.deleteTexture = function(texture)
+  {
+    for (let i = 0; i < UNITS; i++) {
+      const slot = cache.texUnits[i];
+      if (slot['2d'] === texture) slot['2d'] = UNKNOWN;
+      if (slot['cube'] === texture) slot['cube'] = UNKNOWN;
+    }
+    if (statsOn()) count();
+    origDeleteTexture.call(ctx, texture);
+  };
+
+  const origDeleteBuffer = ctx.deleteBuffer;
+  ctx.deleteBuffer = function(buffer)
+  {
+    cache.buffers.forEach((value, key) => { if (value === buffer) cache.buffers.set(key, UNKNOWN); });
+    if (statsOn()) count();
+    origDeleteBuffer.call(ctx, buffer);
+  };
+
+  const origDeleteVertexArray = ctx.deleteVertexArray;
+  ctx.deleteVertexArray = function(vao)
+  {
+    if (cache.vao === vao) cache.vao = UNKNOWN;
+    if (statsOn()) count();
+    origDeleteVertexArray.call(ctx, vao);
+  };
+
+  const origDeleteFramebuffer = ctx.deleteFramebuffer;
+  ctx.deleteFramebuffer = function(framebuffer)
+  {
+    if (cache.fbDraw === framebuffer) cache.fbDraw = UNKNOWN;
+    if (cache.fbRead === framebuffer) cache.fbRead = UNKNOWN;
+    cache.drawBuffersByFbo.delete(framebuffer);
+    cache.readBufferByFbo.delete(framebuffer);
+    if (statsOn()) count();
+    origDeleteFramebuffer.call(ctx, framebuffer);
+  };
+
+  const origDeleteRenderbuffer = ctx.deleteRenderbuffer;
+  ctx.deleteRenderbuffer = function(renderbuffer)
+  {
+    if (typeof origDeleteRenderbuffer === 'function') {
+      cache.renderbuffer.forEach((value, key) => { if (value === renderbuffer) cache.renderbuffer.set(key, UNKNOWN); });
+      origDeleteRenderbuffer.call(ctx, renderbuffer);
+    }
+    if (statsOn()) count();
+  };
+}
+
 var uniformLocationCache = new WeakMap();
 function cachedUniformLocation(program, name)
 {
@@ -12682,6 +13093,10 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
     throw new Error('Your browser does not support WebGL2');
   }
 
+  // Skip redundant WebGL state calls (see installGlStateCache): the sim issues thousands per
+  // frame and most repeat the value that is already set.
+  installGlStateCache(gl);
+
   const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
   if (sim_res_x > maxTexSize || sim_res_y > maxTexSize) {
     const msg = 'This GPU max texture size is ' + maxTexSize +
@@ -21436,6 +21851,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   {
     // Faster EMA (0.80 vs old 0.88) so the auto-iter controller reacts in ~5 frames instead of ~8
     smoothedFrameMs = smoothedFrameMs * 0.80 + frameMs * 0.20;
+    beginGlStateFrameStats();
   }
 
   function handlePause()
