@@ -931,6 +931,177 @@ function pollAsyncReadPixels(reader, dst)
   return true;
 }
 
+// --- Batched weather-station sampling --------------------------------------
+// A station measurement issues nine readPixels (six in measure(), three in the
+// meteogram sample) and used to block the pipeline on every one of them. The reads
+// are now enqueued into pixel-pack buffers for all stations at once and collected
+// once the fence signals; measure() then serves its reads from the collected
+// columns. Each enqueued read covers exactly the range the blocking version asked
+// for, and any read the collected columns cannot serve falls back to readPixels.
+var stationSampleCache = {
+  valid : false,
+  byX : new Map(),
+  simResY : -1,
+};
+
+var stationSamples = {
+  pending : false,
+  frames : 0,
+  readers : [],
+  entries : [],
+};
+
+// A fence that never signals (lost context, broken driver) must not leave stations
+// unmeasured; after this many frames the pass runs against direct reads instead.
+const STATION_SAMPLE_READBACK_MAX_FRAMES = 60;
+
+var stationSampleReaders = [];
+function stationSampleReader(slot)
+{
+  while (stationSampleReaders.length <= slot)
+    stationSampleReaders.push(createAsyncPixelReader());
+  return stationSampleReaders[slot];
+}
+
+function stationSampleColumnFor(x)
+{
+  let col = stationSampleCache.byX.get(x);
+  if (!col) {
+    col = {
+      x : x,
+      base : new Float32Array(sim_res_y * 4),
+      water : new Float32Array(sim_res_y * 4),
+      wall : new Int8Array(sim_res_y * 4),
+      smoke : new Float32Array(sim_res_y),
+      light : new Float32Array(sim_res_y * 4),
+    };
+    stationSampleCache.byX.set(x, col);
+  }
+  return col;
+}
+
+// Serves one station read from the collected columns; returns false when the request
+// has to go to the GPU instead.
+function stationSampleRead(kind, x, y, w, h, dst)
+{
+  if (!stationSampleCache.valid)
+    return false;
+  if (w !== 1 || x < 0 || x >= sim_res_x || y < 0 || h < 1 || y + h > sim_res_y)
+    return false;
+  const col = stationSampleCache.byX.get(x);
+  const src = col && col[kind];
+  if (!src)
+    return false;
+  if (kind === 'smoke') {
+    if (dst.length < h)
+      return false;
+    for (let i = 0; i < h; i++)
+      dst[i] = src[y + i];
+    return true;
+  }
+  if (dst.length < h * 4)
+    return false;
+  for (let i = 0; i < h * 4; i++)
+    dst[i] = src[y * 4 + i];
+  return true;
+}
+
+function beginStationSampleBatch()
+{
+  if (stationSamples.pending)
+    return false;
+  const list = weatherStations;
+  if (!list || !list.length)
+    return false;
+  if (stationSampleCache.simResY !== sim_res_y) {
+    stationSampleCache.byX.clear();
+    stationSampleCache.simResY = sim_res_y;
+  }
+  stationSampleCache.valid = false;
+
+  const h = sim_res_y;
+  const rgbaBytes = h * 16;
+  const wallBytes = h * 4;
+  const entries = [];
+  let slot = 0;
+
+  for (let i = 0; i < list.length; i++) {
+    const x = list[i].getXpos() | 0;
+    if (x < 0 || x >= sim_res_x)
+      continue; // out-of-range column: that station keeps reading the GPU directly
+    const col = stationSampleColumnFor(x);
+    const readers = [];
+    // Attachments of the simulation framebuffer the station reads from.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_0);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    readers.push(stationSampleReader(slot++));
+    beginAsyncReadPixels(readers[readers.length - 1], col.x, 0, 1, h, gl.RGBA, gl.FLOAT, rgbaBytes, null);
+    gl.readBuffer(gl.COLOR_ATTACHMENT1);
+    readers.push(stationSampleReader(slot++));
+    beginAsyncReadPixels(readers[readers.length - 1], col.x, 0, 1, h, gl.RGBA, gl.FLOAT, rgbaBytes, null);
+    gl.readBuffer(gl.COLOR_ATTACHMENT2);
+    readers.push(stationSampleReader(slot++));
+    beginAsyncReadPixels(readers[readers.length - 1], col.x, 0, 1, h, gl.RGBA_INTEGER, gl.BYTE, wallBytes, null);
+    gl.readBuffer(gl.COLOR_ATTACHMENT3);
+    readers.push(stationSampleReader(slot++));
+    beginAsyncReadPixels(readers[readers.length - 1], col.x, 0, 1, h, gl.RED, gl.FLOAT, h * 4, null);
+    // Radiation column lives in its own framebuffer.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, lightFrameBuff_0);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    readers.push(stationSampleReader(slot++));
+    beginAsyncReadPixels(readers[readers.length - 1], col.x, 0, 1, h, gl.RGBA, gl.FLOAT, rgbaBytes, null);
+    entries.push({ col, readers });
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  stationSamples.pending = true;
+  stationSamples.frames = 0;
+  stationSamples.entries = entries;
+  stationSamples.readers = [];
+  for (const entry of entries) {
+    for (const reader of entry.readers)
+      stationSamples.readers.push(reader);
+  }
+  return true;
+}
+
+// Returns true once the batch has been collected (columns valid) or abandoned
+// (columns invalid, measure() then reads the GPU directly).
+function pollStationSampleBatch()
+{
+  if (!stationSamples.pending)
+    return false;
+  stationSamples.frames++;
+  const readers = stationSamples.readers;
+  const last = readers[readers.length - 1];
+  const signaled = !!(last && last.sync
+    && gl.getSyncParameter(last.sync, gl.SYNC_STATUS) === gl.SIGNALED);
+  if (!signaled && stationSamples.frames < STATION_SAMPLE_READBACK_MAX_FRAMES)
+    return false;
+
+  let ok = signaled;
+  for (let i = 0; ok && i < stationSamples.entries.length; i++) {
+    const entry = stationSamples.entries[i];
+    const targets = [ entry.col.base, entry.col.water, entry.col.wall, entry.col.smoke, entry.col.light ];
+    for (let k = 0; k < targets.length; k++) {
+      const reader = entry.readers[k];
+      if (!reader || targets[k].byteLength !== reader.byteSize || !pollAsyncReadPixels(reader, targets[k])) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  if (!ok) {
+    for (const reader of readers)
+      cancelAsyncReadPixels(reader);
+  }
+  stationSamples.pending = false;
+  stationSamples.readers = [];
+  stationSamples.entries = [];
+  stationSampleCache.valid = ok;
+  return true;
+}
+
 var particleLightningReader = createAsyncPixelReader();
 var inactiveDropletReader = createAsyncPixelReader();
 var lightningSummaryReader = createAsyncPixelReader();
@@ -4597,7 +4768,104 @@ var overlayScan = {
   colScratch: null,
   lastFinishIter: -9999,
   hazardsIfPrecip: false,
+  inFlight: null,
 };
+
+// One pixel-pack reader per attachment slot of a scan readback.
+var overlayScanReaders = [];
+function overlayScanReader(slot)
+{
+  while (overlayScanReaders.length <= slot)
+    overlayScanReaders.push(createAsyncPixelReader());
+  return overlayScanReaders[slot];
+}
+
+// A fence that never signals (lost context, broken driver) must not stall the scan
+// forever; after this many frames the blocking read is used instead.
+const OVERLAY_SCAN_READBACK_MAX_FRAMES = 120;
+
+function beginOverlayScanReadback(inflight)
+{
+  const w = sim_res_x;
+  const h = sim_res_y;
+  const baseBytes = w * h * 16;
+  const wallBytes = w * h * 4;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, inflight.frameBuff);
+  gl.readBuffer(gl.COLOR_ATTACHMENT0);
+  inflight.readers.push(overlayScanReader(0));
+  beginAsyncReadPixels(overlayScanReader(0), 0, 0, w, h, gl.RGBA, gl.FLOAT, baseBytes, null);
+  gl.readBuffer(gl.COLOR_ATTACHMENT1);
+  inflight.readers.push(overlayScanReader(1));
+  beginAsyncReadPixels(overlayScanReader(1), 0, 0, w, h, gl.RGBA, gl.FLOAT, baseBytes, null);
+  gl.readBuffer(gl.COLOR_ATTACHMENT2);
+  inflight.readers.push(overlayScanReader(2));
+  beginAsyncReadPixels(overlayScanReader(2), 0, 0, w, h, gl.RGBA_INTEGER, gl.BYTE, wallBytes, null);
+  if (inflight.needCharge && inflight.chargeBuff) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, inflight.chargeBuff);
+    inflight.readers.push(overlayScanReader(3));
+    beginAsyncReadPixels(overlayScanReader(3), 0, 0, w, h, gl.RGBA, gl.FLOAT, baseBytes, null);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+function cancelOverlayScanReadback()
+{
+  if (!overlayScan.inFlight) return;
+  for (const reader of overlayScan.inFlight.readers)
+    cancelAsyncReadPixels(reader);
+  overlayScan.inFlight = null;
+  overlayScan.active = false;
+}
+
+function promoteOverlayScanFromReadback(inflight)
+{
+  overlayScan.inFlight = null;
+  overlayScan.active = true;
+  overlayScan.kind = inflight.kind;
+  overlayScan.barW = inflight.barW;
+  overlayScan.step = inflight.barW;
+  overlayScan.nextIndex = 0;
+  overlayScan.pending = [];
+  overlayScan.pending._barWidth = inflight.barW;
+  overlayScan.needCharge = inflight.needCharge;
+  overlayScan.needHazards = inflight.needHazards;
+  overlayScan.hazardsIfPrecip = inflight.hazardsIfPrecip;
+}
+
+// Returns true once the pending readback has landed; then the scan is active and the
+// per-column walk can start on the collected bytes.
+function pollOverlayScanReadback()
+{
+  const inflight = overlayScan.inFlight;
+  if (!inflight) return true;
+  inflight.frames++;
+  const last = inflight.readers[inflight.readers.length - 1];
+  const signaled = !!(last && last.sync
+    && gl.getSyncParameter(last.sync, gl.SYNC_STATUS) === gl.SIGNALED);
+  if (!signaled && inflight.frames < OVERLAY_SCAN_READBACK_MAX_FRAMES)
+    return false;
+
+  const targets = [ overlayScan.baseAll, overlayScan.waterAll, overlayScan.wallAll, overlayScan.chargeAll ];
+  let ok = signaled;
+  if (ok) {
+    for (let i = 0; i < inflight.readers.length; i++) {
+      const reader = inflight.readers[i];
+      const target = targets[i];
+      if (!target || target.byteLength !== reader.byteSize || !pollAsyncReadPixels(reader, target)) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  if (!ok) {
+    // Fence never signalled or the destination size changed: take the blocking path.
+    for (const reader of inflight.readers)
+      cancelAsyncReadPixels(reader);
+    readOverlayScanTextures(inflight.needCharge, inflight.frameBuff, inflight.chargeBuff);
+  }
+  promoteOverlayScanFromReadback(inflight);
+  return true;
+}
 
 function ensureOverlayScanBuffers(simResX, simResY, needCharge)
 {
@@ -4635,18 +4903,24 @@ function beginOverlayScan(kind, needCharge, needHazards, frameBuff, chargeBuff, 
 {
   const barW = Number.isFinite(barWOverride) ? barWOverride : getSoundingOverlayBarWidth();
   ensureOverlayScanBuffers(sim_res_x, sim_res_y, needCharge);
-  readOverlayScanTextures(needCharge, frameBuff, chargeBuff);
-  overlayScan.active = true;
+  // Enqueue the readback instead of blocking on it; the column walk starts on the
+  // frame the fence signals, reading the same bytes a blocking read would return.
+  overlayScan.active = false;
   overlayScan.kind = kind;
   overlayScan.barW = barW;
-  overlayScan.step = barW;
-  overlayScan.nextIndex = 0;
-  overlayScan.pending = [];
-  overlayScan.pending._barWidth = barW;
-  overlayScan.needCharge = !!needCharge;
-  overlayScan.needHazards = !!needHazards;
-  overlayScan.hazardsIfPrecip = !!(needHazards && guiControls && !guiControls.labelsOverlay
-    && (guiControls.warningsOverlay || guiControls.easAlertsEnabled));
+  overlayScan.inFlight = {
+    kind,
+    barW,
+    frameBuff,
+    chargeBuff,
+    needCharge: !!needCharge,
+    needHazards: !!needHazards,
+    hazardsIfPrecip: !!(needHazards && guiControls && !guiControls.labelsOverlay
+      && (guiControls.warningsOverlay || guiControls.easAlertsEnabled)),
+    frames: 0,
+    readers: [],
+  };
+  beginOverlayScanReadback(overlayScan.inFlight);
 }
 
 function computeOverlayColumnBundle(baseAll, waterAll, wallAll, chargeAll, sx, simResX, simResY, dz, colScratch, options)
@@ -4967,6 +5241,7 @@ function clearTornadoDetection()
 
 function tickOverlayScan()
 {
+  if (overlayScan.inFlight && !pollOverlayScanReadback()) return;
   if (!overlayScan.active) return;
   const step = overlayScan.step;
   const dz = guiControls.simHeight / sim_res_y;
@@ -5033,6 +5308,10 @@ function tickOverlayScan()
 
 function shouldRestartOverlayScan(kind, barW)
 {
+  if (overlayScan.inFlight) {
+    pollOverlayScanReadback();            // may promote the pending read into an active scan
+    if (overlayScan.inFlight) return false; // still waiting on the GPU, do not re-request
+  }
   if (overlayScan.active) {
     if (overlayScan.kind === kind && overlayScan.barW === barW) return false;
     if (overlayScan.kind === kind && overlayScan.barW !== barW) {
@@ -5673,12 +5952,18 @@ class Weatherstation
     const colWall = new Int8Array(h * 4);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_0);
-    gl.readBuffer(gl.COLOR_ATTACHMENT0);
-    gl.readPixels(this.#x, y0, 1, h, gl.RGBA, gl.FLOAT, colBase);
-    gl.readBuffer(gl.COLOR_ATTACHMENT1);
-    gl.readPixels(this.#x, y0, 1, h, gl.RGBA, gl.FLOAT, colWater);
-    gl.readBuffer(gl.COLOR_ATTACHMENT2);
-    gl.readPixels(this.#x, y0, 1, h, gl.RGBA_INTEGER, gl.BYTE, colWall);
+    if (!stationSampleRead('base', this.#x, y0, 1, h, colBase)) {
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.readPixels(this.#x, y0, 1, h, gl.RGBA, gl.FLOAT, colBase);
+    }
+    if (!stationSampleRead('water', this.#x, y0, 1, h, colWater)) {
+      gl.readBuffer(gl.COLOR_ATTACHMENT1);
+      gl.readPixels(this.#x, y0, 1, h, gl.RGBA, gl.FLOAT, colWater);
+    }
+    if (!stationSampleRead('wall', this.#x, y0, 1, h, colWall)) {
+      gl.readBuffer(gl.COLOR_ATTACHMENT2);
+      gl.readPixels(this.#x, y0, 1, h, gl.RGBA_INTEGER, gl.BYTE, colWall);
+    }
 
     const dz = guiControls.simHeight / sim_res_y;
     const altsM = new Float32Array(nLev);
@@ -5775,9 +6060,11 @@ class Weatherstation
   measure()
   {
     gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_0);
-    gl.readBuffer(gl.COLOR_ATTACHMENT0); // basetexture
     var baseTextureValues = new Float32Array(4 * 3);
-    gl.readPixels(this.#x, this.#y - 1, 1, 3, gl.RGBA, gl.FLOAT, baseTextureValues);
+    if (!stationSampleRead('base', this.#x, this.#y - 1, 1, 3, baseTextureValues)) {
+      gl.readBuffer(gl.COLOR_ATTACHMENT0); // basetexture
+      gl.readPixels(this.#x, this.#y - 1, 1, 3, gl.RGBA, gl.FLOAT, baseTextureValues);
+    }
 
     let T = potentialToRealT(baseTextureValues[1 * 4 + 3], this.#y); // temperature in kelvin
 
@@ -5794,10 +6081,14 @@ class Weatherstation
       const h = Math.max(1, Math.min(depthCells, sim_res_y - y0));
       const colBase = new Float32Array(h * 4);
       const colWall = new Int8Array(h * 4);
-      gl.readBuffer(gl.COLOR_ATTACHMENT0);
-      gl.readPixels(this.#x, y0, 1, h, gl.RGBA, gl.FLOAT, colBase);
-      gl.readBuffer(gl.COLOR_ATTACHMENT2);
-      gl.readPixels(this.#x, y0, 1, h, gl.RGBA_INTEGER, gl.BYTE, colWall);
+      if (!stationSampleRead('base', this.#x, y0, 1, h, colBase)) {
+        gl.readBuffer(gl.COLOR_ATTACHMENT0);
+        gl.readPixels(this.#x, y0, 1, h, gl.RGBA, gl.FLOAT, colBase);
+      }
+      if (!stationSampleRead('wall', this.#x, y0, 1, h, colWall)) {
+        gl.readBuffer(gl.COLOR_ATTACHMENT2);
+        gl.readPixels(this.#x, y0, 1, h, gl.RGBA_INTEGER, gl.BYTE, colWall);
+      }
       const envTempsC = new Float32Array(sim_res_y);
       const isFluid = new Array(sim_res_y);
       const fluidPressure = new Float32Array(sim_res_y);
@@ -5825,10 +6116,12 @@ class Weatherstation
       this.#stationHpa = totalPressureHpaAt(this.#x, this.#y, baseTextureValues[1 * 4 + 2]);
     }
 
-    // gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_0);
-    gl.readBuffer(gl.COLOR_ATTACHMENT1); // watertexture
     var waterTextureValues = new Float32Array(2 * 4);
-    gl.readPixels(this.#x, this.#y - 1, 1, 2, gl.RGBA, gl.FLOAT, waterTextureValues);
+    if (!stationSampleRead('water', this.#x, this.#y - 1, 1, 2, waterTextureValues)) {
+      // gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_0);
+      gl.readBuffer(gl.COLOR_ATTACHMENT1); // watertexture
+      gl.readPixels(this.#x, this.#y - 1, 1, 2, gl.RGBA, gl.FLOAT, waterTextureValues);
+    }
 
     if (waterTextureValues[4 + 0] > 1000.) { // is not air
       this.destroy();                        // remove weather station
@@ -5899,15 +6192,19 @@ class Weatherstation
 
     // Sample combustion smoke (R32F attachment 3)
     gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_0);
-    gl.readBuffer(gl.COLOR_ATTACHMENT3);
     var smokeTextureValues = new Float32Array(1);
-    gl.readPixels(this.#x, this.#y, 1, 1, gl.RED, gl.FLOAT, smokeTextureValues);
+    if (!stationSampleRead('smoke', this.#x, this.#y, 1, 1, smokeTextureValues)) {
+      gl.readBuffer(gl.COLOR_ATTACHMENT3);
+      gl.readPixels(this.#x, this.#y, 1, 1, gl.RED, gl.FLOAT, smokeTextureValues);
+    }
     this.#airQuality = (waterTextureValues[4 + 3] + smokeTextureValues[0]) * 300.0; // dust + smoke
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, lightFrameBuff_0);
-    gl.readBuffer(gl.COLOR_ATTACHMENT0); // light texture
     var lightTextureValues = new Float32Array(4);
-    gl.readPixels(this.#x, this.#y, 1, 1, gl.RGBA, gl.FLOAT, lightTextureValues);
+    if (!stationSampleRead('light', this.#x, this.#y, 1, 1, lightTextureValues)) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, lightFrameBuff_0);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0); // light texture
+      gl.readPixels(this.#x, this.#y, 1, 1, gl.RGBA, gl.FLOAT, lightTextureValues);
+    }
 
     this.#netIRpow = lightTextureValues[2] - lightTextureValues[3]; // IR_DOWN - IR_UP
     // this.#netIRpow = lightTextureValues[1] / 0.000002; // or calculate from NET_HEATING
@@ -14470,6 +14767,7 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
     displayOverlays.add(guiControls, 'soundingOverlayBarWidth', 0.25, 20, 0.25)
       .name('Sounding/Risk Bar Width')
       .onChange(function() {
+        cancelOverlayScanReadback();
         overlayScan.active = false;
         overlayScan.lastFinishIter = -9999;
         riskData = [];
@@ -31894,6 +32192,12 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   {
     if (!overlayWantsBackgroundSoundingScan()) return;
 
+    // A readback requested earlier resolves here; nothing new may start while it runs.
+    if (overlayScan.inFlight) {
+      pollOverlayScanReadback();
+      if (overlayScan.inFlight) return;
+    }
+
     const riskFreq = Math.max(10, guiControls.riskUpdateFrequency | 0);
     const tornadoFreq = tornadoDetectionUpdateInterval();
     const tornadoOn = !!guiControls.tornadoDetectionOverlay;
@@ -32967,9 +33271,17 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
             }
 
             if (displayWeatherStations && iterNum % (guiControls.reducedWeatherStationUpdates ? 416 : 208) == 0) { // ~every 60 in game seconds:  0.00008 *3600 * 208 = 59.9, reduced = every 120 seconds
-              for (i = 0; i < weatherStations.length; i++) {
-                weatherStations[i].measure();
+              // Queue the column readback; the measurement pass runs on the frame it lands,
+              // on the bytes a blocking read at this point would have returned.
+              beginStationSampleBatch();
+            }
+            if (stationSamples.pending && pollStationSampleBatch()) {
+              if (displayWeatherStations) {
+                for (i = 0; i < weatherStations.length; i++) {
+                  weatherStations[i].measure();
+                }
               }
+              stationSampleCache.valid = false; // one-shot: later reads go to the GPU directly
             }
             if (!airplaneMode && !guiControls.realtimeMode) {
               iterNum++;
