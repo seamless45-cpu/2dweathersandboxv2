@@ -992,6 +992,9 @@ function stationSampleRead(kind, x, y, w, h, dst)
   const src = col && col[kind];
   if (!src)
     return false;
+  const stride = kind === 'smoke' ? 1 : 4;
+  if (src.length < (y + h) * stride) // grid resolution changed under the collected column
+    return false;
   if (kind === 'smoke') {
     if (dst.length < h)
       return false;
@@ -1079,7 +1082,8 @@ function pollStationSampleBatch()
   if (!signaled && stationSamples.frames < STATION_SAMPLE_READBACK_MAX_FRAMES)
     return false;
 
-  let ok = signaled;
+  // A grid resolution change between kick-off and collection invalidates the columns.
+  let ok = signaled && stationSampleCache.simResY === sim_res_y;
   for (let i = 0; ok && i < stationSamples.entries.length; i++) {
     const entry = stationSamples.entries[i];
     const targets = [ entry.col.base, entry.col.water, entry.col.wall, entry.col.smoke, entry.col.light ];

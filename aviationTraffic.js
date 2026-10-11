@@ -39,6 +39,7 @@
   let selectedRouteId = null;
   let dragState = null; // { routeId, index } while dragging a waypoint
   let routeOverlayCanvas = null;
+  let routeOverlayBox = '';
   let routeOverlayCtx = null;
   let displayAirports = true;
   let displayFlightRoutes = true;
@@ -1668,11 +1669,18 @@
         routeOverlayCanvas.width = main.width;
         routeOverlayCanvas.height = main.height;
       }
+      // Only touch the DOM when the box actually moved: re-writing identical positions every
+      // frame keeps the layout dirty and makes the next frame's getBoundingClientRect() force
+      // a synchronous reflow of the whole page.
       const rect = main.getBoundingClientRect();
-      routeOverlayCanvas.style.left = rect.left + 'px';
-      routeOverlayCanvas.style.top = rect.top + 'px';
-      routeOverlayCanvas.style.width = rect.width + 'px';
-      routeOverlayCanvas.style.height = rect.height + 'px';
+      const box = rect.left + ',' + rect.top + ',' + rect.width + ',' + rect.height;
+      if (box !== routeOverlayBox) {
+        routeOverlayBox = box;
+        routeOverlayCanvas.style.left = rect.left + 'px';
+        routeOverlayCanvas.style.top = rect.top + 'px';
+        routeOverlayCanvas.style.width = rect.width + 'px';
+        routeOverlayCanvas.style.height = rect.height + 'px';
+      }
     }
 
     const showRoutes = displayFlightRoutes
