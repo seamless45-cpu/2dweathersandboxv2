@@ -5648,6 +5648,14 @@ function createLightningIllumFBOs(scaleIn)
   setupTex(lightningSurfFlashTex);
 
   // Recreate blur FBOs at matching resolution (FBO class allocates on construct).
+  // The previous ones are released first: their GL texture and framebuffer objects
+  // would otherwise stay allocated for the life of the context on every rescale.
+  for (const stale of [ lightningCloudFlashBlurFBO, lightningSurfFlashBlurFBO, lightningBlurTempFBO ]) {
+    if (!stale)
+      continue;
+    if (stale.texture) gl.deleteTexture(stale.texture);
+    if (stale.frameBuffer) gl.deleteFramebuffer(stale.frameBuffer);
+  }
   lightningCloudFlashBlurFBO = new FBO(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
   lightningSurfFlashBlurFBO = new FBO(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
   lightningBlurTempFBO = new FBO(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
@@ -21249,12 +21257,33 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     }
 
     if (guiControls.readoutCursor && !SETUP_MODE) {
-      updateCursorReadout(event);
+      // The readout reads the simulation textures (one blocking readPixels per value
+      // shown, so up to a handful per call). Mouse events can arrive faster than the
+      // sim draws, so the work is coalesced to at most one readout per animation
+      // frame, using the last event — the frame the user sees updates once anyway.
+      pendingCursorReadout = true;
+      pendingCursorReadoutX = event.clientX;
+      pendingCursorReadoutY = event.clientY;
+      if (!cursorReadoutFrameScheduled) {
+        cursorReadoutFrameScheduled = true;
+        requestAnimationFrame(function() {
+          cursorReadoutFrameScheduled = false;
+          if (!pendingCursorReadout) return;
+          pendingCursorReadout = false;
+          if (guiControls.readoutCursor && !SETUP_MODE)
+            updateCursorReadout({ clientX : pendingCursorReadoutX, clientY : pendingCursorReadoutY });
+        });
+      }
     }
   });
 
   canvas.addEventListener('mousedown', function(e) { mouseDownEvent(e); });
   graphCanvas.addEventListener('mousedown', function(e) { mouseDownEvent(e); });
+
+  var pendingCursorReadout = false;
+  var pendingCursorReadoutX = 0;
+  var pendingCursorReadoutY = 0;
+  var cursorReadoutFrameScheduled = false;
 
   function updateCursorReadout(event)
   {
