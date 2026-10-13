@@ -703,6 +703,7 @@ const guiControls_default = {
   dbzOpacityStrength : 0.9,
   riskUpdateFrequency : 60,
   soundingOverlayBarWidth : 8, // sim columns per color bar (finer = smaller; updates are incremental)
+  overlayScanBudgetMs : 2.0,   // per-frame CPU budget for the sounding/risk/EAS column scan
   starVisibility : 0.25,
   starLightEmitStrength : 0.15,
   starDensity : 0.5,
@@ -1937,6 +1938,28 @@ const REALTIME_MAX_CATCHUP_MS = 500; // cap lag catch-up so a long stall does no
 // advection shader samples them from soundingProfileTexture instead.
 const SIM_PROFILE_SAMPLES = 504;
 const TARGET_FRAME_MS = 28;
+// The skew-T graph's CAPE/parcel/hodograph analysis is inherent work (parcel ascents and
+// CAPE integrations over the whole column) that costs ~100 ms on a default grid, so it is
+// refreshed at a bounded rate instead of on every frame while the graph is open. The curves
+// keep drawing from the column readback, which is reused for the same window. When the mouse
+// moves to another column the analysis follows at up to 25 Hz; once the column is stable the
+// numbers refresh ~9 times a second. Nothing is dropped and no formula changes.
+const SOUNDING_ANALYSIS_MIN_INTERVAL_MS = 40;
+const SOUNDING_ANALYSIS_MAX_INTERVAL_MS = 110;
+const SOUNDING_ANALYSIS_MAX_AGE_FRAMES = 24;
+
+// Whether the skew-T graph must recompute its analysis (and re-read the column snapshot it
+// belongs to) this frame. Pure function: keep the refresh policy in one place and testable.
+function shouldRefreshSoundingAnalysis(cachedAnalysis, analysisKey, nowMs, lightSkewT)
+{
+  if (lightSkewT || !cachedAnalysis) return true;
+  const ageMs = nowMs - cachedAnalysis.timeMs;
+  const sameColumn = cachedAnalysis.key === analysisKey;
+  return ageMs >= (sameColumn ? SOUNDING_ANALYSIS_MAX_INTERVAL_MS : SOUNDING_ANALYSIS_MIN_INTERVAL_MS);
+}
+// Mirror of the main loop's smoothed frame time for code outside that scope (the
+// background overlay scan uses it to stay out of the way when frames are heavy).
+var lastFrameTimeMsForScheduling = 16;
 
 var NUM_DROPLETS;
 const NUM_DROPLETS_DEVIDER = 25; // baseline cells-per-droplet at default res
@@ -2938,13 +2961,35 @@ function beginPhysicalPressureColumn(simX, fluidPressure, isFluid, surfaceLevel,
   while (y0 < simResY - 1 && isFluid && !isFluid[y0])
     y0++;
 
+  // Per-row reference pressure and density only change when the reference profile is
+  // rebuilt, so they are cached instead of recomputed for every scan column. The synoptic
+  // parameters are read once per column instead of once per row. The arithmetic below is
+  // identical to refPressureHpaAt()/fluidPressureToHpa()/synopticBackgroundHpa().
+  const refRows = refPressureRowCacheFor(simResY);
+  const densityRows = fluidDensityRowCacheFor(simResY).density;
+  const fluidConv = fluidPressurePaPerUnitPerRho();
+  const syn = synopticColumnCacheRefresh();
+  const synAspect = sim_res_y / sim_res_x;
+  const synWrap = !!(guiControls && guiControls.wrapHorizontally);
+  const pressureRowMeanValid = !!(pressureRowMeanCpu && pressureRowMeanCpu.length);
   const pByY = new Float32Array(simResY);
   let offset = 0; // anomaly vs reference, carried through non-fluid rows
   for (let y = y0; y < simResY; y++) {
-    const ref = refPressureHpaAt(y);
+    const ref = refRows[y];
     if (!isFluid || isFluid[y]) {
       const fp = fluidPressure ? fluidPressure[y] : NaN;
-      const p = Number.isFinite(fp) ? totalPressureHpaAt(simX, y, fp) : ref + synopticBackgroundHpa(simX, y);
+      let p;
+      if (Number.isFinite(fp)) {
+        let fpEff = fp;
+        if (pressureRowMeanValid) {
+          const mean = pressureRowMeanCpu[y];
+          if (Number.isFinite(mean))
+            fpEff -= mean;
+        }
+        p = ref + fpEff * densityRows[y] * fluidConv * 0.01 + synopticHpaFromColumnCache(syn, simX, y, synAspect, synWrap);
+      } else {
+        p = ref + synopticHpaFromColumnCache(syn, simX, y, synAspect, synWrap);
+      }
       if (Number.isFinite(p))
         offset = p - ref;
     }
@@ -3007,6 +3052,9 @@ var synopticGpuPack = new Float32Array(MAX_SYNOPTIC_SYSTEMS * 4);
 
 // { pHpa, rho, vapor } Float32Arrays of SIM_PROFILE_SAMPLES, sampled like initial_T.
 var refPressureProfile = null;
+// Bumped whenever the reference profile is rebuilt, so per-row caches below can tell
+// when they are stale.
+var refPressureProfileVersion = 0;
 var refPressureInitialT = null;
 // Per sim row (air cells only), refreshed asynchronously by the row-mean pass:
 // robust mean fluid PRESSURE, air cell count, mean potential temperature (K), mean vapor (g/m^3).
@@ -3108,6 +3156,7 @@ function buildReferencePressureProfile(initialT)
     prev = cur;
   }
   refPressureProfile = { pHpa, rho, vapor };
+  refPressureProfileVersion++;
   return refPressureProfile;
 }
 
@@ -3250,6 +3299,115 @@ function refPressureHpaAt(cellY)
   if (refPressureProfile)
     return refProfileValueAt(refPressureProfile.pHpa, cellY);
   return isaPressureHpa(cellY * (guiControls.simHeight / Math.max(sim_res_y, 1)));
+}
+
+// Per-row reference pressure, built once per (profile, grid) and reused by the pressure
+// column and skew-T helpers. refPressureHpaAt() itself is unchanged; this only avoids
+// repeating the same interpolations for every scan column.
+var refPressureRowCache = { version : -1, simResY : -1, hpa : null };
+
+function refPressureRowCacheFor(simResY)
+{
+  const cache = refPressureRowCache;
+  if (cache.version !== refPressureProfileVersion || cache.simResY !== simResY) {
+    if (!cache.hpa || cache.hpa.length !== simResY)
+      cache.hpa = new Float64Array(simResY);
+    for (let y = 0; y < simResY; y++)
+      cache.hpa[y] = refPressureHpaAt(y);
+    cache.version = refPressureProfileVersion;
+    cache.simResY = simResY;
+  }
+  return cache.hpa;
+}
+
+// Per-row density factor used by fluidPressureToHpa(), cached like the pressure rows.
+var fluidDensityRowCache = { version : -1, simResY : -1, anelastic : null, rho0 : 0, density : null };
+
+function fluidDensityRowCacheFor(simResY)
+{
+  const cache = fluidDensityRowCache;
+  const anelastic = isAnelasticPressureMode();
+  if (cache.version !== refPressureProfileVersion || cache.simResY !== simResY || cache.anelastic !== anelastic) {
+    if (!cache.density || cache.density.length !== simResY)
+      cache.density = new Float64Array(simResY);
+    if (!refPressureProfile) {
+      cache.density.fill(1.225);
+      cache.rho0 = 1.225;
+    } else if (anelastic) {
+      cache.rho0 = refPressureProfile.rho[0];
+      cache.density.fill(cache.rho0);
+    } else {
+      const rho = refPressureProfile.rho;
+      for (let y = 0; y < simResY; y++)
+        cache.density[y] = refProfileValueAt(rho, y);
+      cache.rho0 = refProfileValueAt(rho, 0);
+    }
+    cache.version = refPressureProfileVersion;
+    cache.simResY = simResY;
+    cache.anelastic = anelastic;
+  }
+  return cache;
+}
+
+// Synoptic systems as flat arrays (x, radius, amplitude sign included), rebuilt only when
+// the system list or its parameters change. synopticBackgroundHpa() keeps its exact formula;
+// this exists so the per-level pressure build does not call getRadius()/getStrength()
+// several thousand times per scan column.
+var synopticColumnCache = { count : 0, x : new Float64Array(0), radius : new Float64Array(0), amp : new Float64Array(0) };
+
+// Evaluates the synoptic background pressure for one cell from the flat column cache.
+// Same formula, same accumulation order and same vertical profile as synopticBackgroundHpa().
+function synopticHpaFromColumnCache(cache, simX, simY, aspect, wrapX)
+{
+  if (!cache || !cache.count)
+    return 0;
+  let sum = 0;
+  for (let g = 0; g < cache.count; g++) {
+    let dx = simX - cache.x[g];
+    if (wrapX) {
+      const adx = Math.abs(dx);
+      dx = adx <= sim_res_x - adx ? dx : (dx > 0 ? dx - sim_res_x : dx + sim_res_x);
+    }
+    const d = Math.abs(dx) * aspect / cache.radius[g];
+    if (d >= 1)
+      continue;
+    sum += cache.amp[g] * (1 - d * d * (3 - 2 * d));
+  }
+  return sum * synopticVerticalProfile(clamp(simY / Math.max(sim_res_y, 1), 0, 1));
+}
+
+function synopticColumnCacheRefresh()
+{
+  const cache = synopticColumnCache;
+  const list = (typeof synopticSystems !== 'undefined' && synopticSystems) ? synopticSystems : null;
+  cache.listRef = list;
+  cache.listLen = list ? list.length : 0;
+  cache.count = 0;
+  if (!list || !list.length || (guiControls && guiControls.enableSynopticSystems === false))
+    return cache;
+  const amp = synopticAmplitudeHpa();
+  if (!(amp > 0))
+    return cache;
+  const n = Math.min(list.length, MAX_SYNOPTIC_SYSTEMS);
+  if (cache.x.length !== n) {
+    cache.x = new Float64Array(n);
+    cache.radius = new Float64Array(n);
+    cache.amp = new Float64Array(n);
+  }
+  let count = 0;
+  for (let g = 0; g < list.length && count < MAX_SYNOPTIC_SYSTEMS; g++) {
+    const sys = list[g];
+    const radius = sys.getRadius();
+    const strength = sys.getStrength();
+    if (strength <= 0.0001 || radius < 1)
+      continue;
+    cache.x[count] = sys.getXpos();
+    cache.radius[count] = radius;
+    cache.amp[count] = (sys.getType() === 0 ? -1.0 : 1.0) * amp * strength;
+    count++;
+  }
+  cache.count = count;
+  return cache;
 }
 
 /** Fractional sim row where the reference column crosses hpa (NaN outside the domain). */
@@ -3538,15 +3696,15 @@ function integrateCapeSegment(B0, B1, dz)
   return {pos: B0 * zcross * 0.5, neg: B1 * (dz - zcross) * 0.5};
 }
 
-function computeParcelProfileForColumn(surfaceTempC, surfaceTdC, startIndex, simResY, dz)
+function computeParcelProfileForColumn(surfaceTempC, surfaceTdC, startIndex, simResY, dz, outProfile, thermo)
 {
-  const parcelTemps = new Float32Array(simResY);
+  const parcelTemps = outProfile || new Float32Array(simResY);
   parcelTemps.fill(NaN);
   if (!Number.isFinite(surfaceTempC) || !Number.isFinite(surfaceTdC) || startIndex < 0 || startIndex >= simResY)
     return parcelTemps;
 
   const startAlt = startIndex * dz;
-  const p0 = skewHpaFromAltM(startAlt);
+  const p0 = thermo ? thermo.pAt[startIndex] : skewHpaFromAltM(startAlt);
   const mixW = mixingRatioKgFromDewpoint(Math.min(surfaceTdC, surfaceTempC), p0);
   let T = surfaceTempC;
   let saturated = surfaceTempC <= surfaceTdC + 0.05;
@@ -3554,7 +3712,7 @@ function computeParcelProfileForColumn(surfaceTempC, surfaceTdC, startIndex, sim
 
   for (let y = startIndex + 1; y < simResY; y++) {
     const alt = y * dz;
-    const p = skewHpaFromAltM(alt);
+    const p = thermo ? thermo.pAt[y] : skewHpaFromAltM(alt);
     if (!saturated) {
       T -= METEO_DRY_LAPSE_K_PER_M * dz;
       const tdParcel = dewpointFromMixingRatioKg(mixW, p);
@@ -3612,7 +3770,7 @@ function integrateBuoyLayerCol(buoy, altBot, altTop, mode, startIndex, simResY, 
   return total;
 }
 
-function findLclAltFromParcel(parcelTemps, envDewC, startIndex, simResY, dz, isFluid, parcelTdC)
+function findLclAltFromParcel(parcelTemps, envDewC, startIndex, simResY, dz, isFluid, parcelTdC, thermo)
 {
   const altFromIndex = (index) => index * dz;
   const parcelBaseAlt = altFromIndex(startIndex);
@@ -3621,7 +3779,7 @@ function findLclAltFromParcel(parcelTemps, envDewC, startIndex, simResY, dz, isF
   if (!Number.isFinite(surfT) || !Number.isFinite(surfTd)) return parcelBaseAlt;
   if (surfT <= surfTd + 0.05) return parcelBaseAlt;
 
-  const p0 = skewHpaFromAltM(parcelBaseAlt);
+  const p0 = thermo ? thermo.pAt[startIndex] : skewHpaFromAltM(parcelBaseAlt);
   const mixW = mixingRatioKgFromDewpoint(Math.min(surfTd, surfT), p0);
   let T = surfT;
   let prevAlt = parcelBaseAlt;
@@ -3629,7 +3787,7 @@ function findLclAltFromParcel(parcelTemps, envDewC, startIndex, simResY, dz, isF
   for (let y = startIndex + 1; y < simResY; y++) {
     if (isFluid && !isFluid[y]) continue;
     const alt = altFromIndex(y);
-    const p = skewHpaFromAltM(alt);
+    const p = thermo ? thermo.pAt[y] : skewHpaFromAltM(alt);
     const Tprev = T;
     T -= METEO_DRY_LAPSE_K_PER_M * dz;
     const tdHere = dewpointFromMixingRatioKg(mixW, p);
@@ -3645,7 +3803,7 @@ function findLclAltFromParcel(parcelTemps, envDewC, startIndex, simResY, dz, isF
   return parcelBaseAlt + Math.max(0, (surfT - surfTd) / 8.0) * 1000.0;
 }
 
-function computeCAPEForColumn(envTempsC, envDewC, parcelTemps, startIndex, isFluid, simResY, dz, sfcAltM, parcelTdC)
+function computeCAPEForColumn(envTempsC, envDewC, parcelTemps, startIndex, isFluid, simResY, dz, sfcAltM, parcelTdC, thermo)
 {
   const B_MIN = 0.02;
   const MIN_CAPE_LAYER_M = 350;
@@ -3660,12 +3818,12 @@ function computeCAPEForColumn(envTempsC, envDewC, parcelTemps, startIndex, isFlu
   const surfT = parcelTemps[startIndex];
   const surfTd = Number.isFinite(parcelTdC) ? parcelTdC
     : (Number.isFinite(envDewC[startIndex]) ? envDewC[startIndex] : surfT);
-  const pStart = skewHpaFromAltM(altFromIndex(startIndex));
+  const pStart = thermo ? thermo.pAt[startIndex] : skewHpaFromAltM(altFromIndex(startIndex));
   const parcelMixW = mixingRatioKgFromDewpoint(
     Math.min(Number.isFinite(surfTd) ? surfTd : surfT, Number.isFinite(surfT) ? surfT : surfTd),
     pStart);
 
-  const buoy = new Float32Array(simResY);
+  const buoy = columnThermoScratchView('buoy', Float32Array, simResY);
   let saturated = Number.isFinite(surfTd) && Number.isFinite(surfT) && surfT <= surfTd + 0.05;
   for (let y = startIndex; y < simResY; y++) {
     if (isNaN(parcelTemps[y])) {
@@ -3677,10 +3835,9 @@ function computeCAPEForColumn(envTempsC, envDewC, parcelTemps, startIndex, isFlu
       continue;
     }
     const alt = altFromIndex(y);
-    const p = skewHpaFromAltM(alt);
-    const envTk = CtoK(envTempsC[y]);
-    const envW = mixingRatioKgFromDewpoint(envDewC[y], p);
-    const envTv = virtualTemperatureK(envTk, envW);
+    const p = thermo ? thermo.pAt[y] : skewHpaFromAltM(alt);
+    const envTv = thermo ? thermo.envTv[y]
+      : virtualTemperatureK(CtoK(envTempsC[y]), mixingRatioKgFromDewpoint(envDewC[y], p));
 
     if (!saturated) {
       const tdParcel = dewpointFromMixingRatioKg(parcelMixW, p);
@@ -3701,7 +3858,7 @@ function computeCAPEForColumn(envTempsC, envDewC, parcelTemps, startIndex, isFlu
   }
 
   const parcelBaseAlt = altFromIndex(startIndex);
-  lclAlt = findLclAltFromParcel(parcelTemps, envDewC, startIndex, simResY, dz, isFluid, surfTd);
+  lclAlt = findLclAltFromParcel(parcelTemps, envDewC, startIndex, simResY, dz, isFluid, surfTd, thermo);
 
   if (buoy[startIndex] > B_MIN) {
     lfcAlt = parcelBaseAlt;
@@ -3812,7 +3969,7 @@ function computeCAPEForColumn(envTempsC, envDewC, parcelTemps, startIndex, isFlu
   return {cape, cinh, lclAlt, lfcAlt, elAlt, cape3km};
 }
 
-function meanLayerParcelForColumn(envTempsC, envDewC, startIndex, simResY, dz)
+function meanLayerParcelForColumn(envTempsC, envDewC, startIndex, simResY, dz, outProfile, thermo)
 {
   const maxLevels = Math.max(1, Math.min(simResY - startIndex, Math.round(1000 / dz)));
   let sumT = 0.0;
@@ -3827,15 +3984,56 @@ function meanLayerParcelForColumn(envTempsC, envDewC, startIndex, simResY, dz)
   if (!count) {
     const t0 = Number.isFinite(envTempsC[startIndex]) ? envTempsC[startIndex] : 0;
     const d0 = Number.isFinite(envDewC[startIndex]) ? envDewC[startIndex] : t0;
-    const profile = computeParcelProfileForColumn(t0, d0, startIndex, simResY, dz);
+    const profile = computeParcelProfileForColumn(t0, d0, startIndex, simResY, dz, outProfile, thermo);
     profile._parcelTd = d0;
     return profile;
   }
   const meanT = sumT / count;
   const meanTd = sumTd / count;
-  const profile = computeParcelProfileForColumn(meanT, meanTd, startIndex, simResY, dz);
+  const profile = computeParcelProfileForColumn(meanT, meanTd, startIndex, simResY, dz, outProfile, thermo);
   profile._parcelTd = meanTd;
   return profile;
+}
+
+// ---------------------------------------------------------------------------
+// Column thermodynamics scratch
+// ---------------------------------------------------------------------------
+// A scan column computes CAPE/CIN for the surface parcel, the mean-layer parcel and up
+// to eight mixed-layer search parcels. Per-level values that do not depend on the parcel
+// (the pressure at a row, the environmental virtual temperature) used to be recomputed
+// for every one of those parcels; they are built once per column here and passed down.
+// The cached numbers are produced by the exact same formulas, so results are unchanged —
+// only the repeated work is gone.
+var columnThermoCache = { simResY : -1, pAt : null, envTv : null };
+
+function buildColumnThermoCache(envTempsC, envDewC, simResY, dz)
+{
+  const cache = columnThermoCache;
+  if (cache.simResY !== simResY) {
+    cache.simResY = simResY;
+    cache.pAt = new Float64Array(simResY);
+    cache.envTv = new Float64Array(simResY);
+  }
+  const pAt = cache.pAt;
+  const envTv = cache.envTv;
+  for (let y = 0; y < simResY; y++)
+    pAt[y] = skewHpaFromAltM(y * dz);
+  for (let y = 0; y < simResY; y++)
+    envTv[y] = virtualTemperatureK(CtoK(envTempsC[y]), mixingRatioKgFromDewpoint(envDewC[y], pAt[y]));
+  return cache;
+}
+
+// Grow-only scratch for the per-parcel working arrays (buoyancy profile, parcel
+// temperature profiles). Callers that need two of these alive at once use separate keys.
+var columnThermoScratch = {};
+function columnThermoScratchView(key, Type, len)
+{
+  let buf = columnThermoScratch[key];
+  if (!buf || buf.length < len) {
+    buf = new Type(len);
+    columnThermoScratch[key] = buf;
+  }
+  return buf.length === len ? buf : buf.subarray(0, len);
 }
 
 function computeColumnSoundingMetrics(envTempsC, envDewC, isFluid, vxRaw, vyRaw, waterArr, simResY, dz, options)
@@ -3869,17 +4067,73 @@ function computeColumnSoundingMetrics(envTempsC, envDewC, isFluid, vxRaw, vyRaw,
   return metricsResult;
 }
 
+// Skew-T graph: the most-unstable (0-3 km parcel origin), elevated-parcel (>=1.5 km origin)
+// and 0-3 km CAPE searches cover overlapping candidate levels and ask exactly the same
+// question at each level, so each candidate's parcel profile and CAPE are computed once and
+// feed all three maxima. Same candidates, same order and same comparisons as running the
+// three searches separately, which gives the same values for a fraction of the cost.
+// Returns muParcelLevel < 0 when no candidate beat a CAPE of zero.
+function computeColumnParcelSearches(envTempsC, envDewC, columnIsFluid, isFluidAt, simResY, dz, sfcAltM, surfaceLevel, muSearchMax, thermo)
+{
+  const elevOriginMin = surfaceLevel + Math.round(1500 / dz);
+  const max3kmLevel = Math.min(surfaceLevel + Math.round(3000 / dz), simResY);
+  const analysisTop = Math.max(muSearchMax, max3kmLevel - 1);
+  let muCape = 0;
+  let muCinh = NaN;
+  let muLcl = NaN;
+  let muLfc = NaN;
+  let muEl = NaN;
+  let muParcelLevel = -1;
+  let elevatedCape = 0;
+  let cape3km = 0;
+  for (let y = surfaceLevel; y <= analysisTop; y++) {
+    if (!isFluidAt(y)) continue;
+    const inMu = y <= muSearchMax;
+    const inElevated = y >= elevOriginMin && y <= muSearchMax;
+    const in3km = y < max3kmLevel;
+    if (!inMu && !inElevated && !in3km) continue;
+    const pp = computeParcelProfileForColumn(envTempsC[y], envDewC[y], y, simResY, dz,
+      columnThermoScratchView('graphParcel', Float32Array, simResY), thermo);
+    const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, columnIsFluid, simResY, dz, sfcAltM, envDewC[y], thermo);
+    if (inMu && m.cape > muCape) {
+      muCape = m.cape;
+      muCinh = m.cinh;
+      muLcl = m.lclAlt;
+      muLfc = m.lfcAlt;
+      muEl = m.elAlt;
+      muParcelLevel = y;
+    }
+    if (inElevated && m.cape > elevatedCape) elevatedCape = m.cape;
+    if (in3km && m.cape3km > cape3km) cape3km = m.cape3km;
+  }
+  return {
+    muCape : muCape,
+    muCinh : muCinh,
+    muLcl : muLcl,
+    muLfc : muLfc,
+    muEl : muEl,
+    muParcelLevel : muParcelLevel,
+    elevatedCape : elevatedCape,
+    cape3km : cape3km,
+  };
+}
+
 function computeColumnSoundingMetricsBody(envTempsC, envDewC, isFluid, vxRaw, vyRaw, waterArr, simResY, dz, options, surfaceLevel, sfcAltM, lite)
 {
+  // Per-level pressure and environmental virtual temperature only depend on the column,
+  // not on the parcel; build them once instead of once per candidate parcel.
+  const thermo = buildColumnThermoCache(envTempsC, envDewC, simResY, dz);
   const sbProfile = computeParcelProfileForColumn(
-    envTempsC[surfaceLevel], envDewC[surfaceLevel], surfaceLevel, simResY, dz);
+    envTempsC[surfaceLevel], envDewC[surfaceLevel], surfaceLevel, simResY, dz,
+    columnThermoScratchView('parcelSfc', Float32Array, simResY), thermo);
   const sbMetrics = computeCAPEForColumn(
-    envTempsC, envDewC, sbProfile, surfaceLevel, isFluid, simResY, dz, sfcAltM, envDewC[surfaceLevel]);
+    envTempsC, envDewC, sbProfile, surfaceLevel, isFluid, simResY, dz, sfcAltM, envDewC[surfaceLevel], thermo);
   const sbCape = sbMetrics.cape;
 
-  const mlProfile = meanLayerParcelForColumn(envTempsC, envDewC, surfaceLevel, simResY, dz);
+  const mlProfile = meanLayerParcelForColumn(envTempsC, envDewC, surfaceLevel, simResY, dz,
+    columnThermoScratchView('parcelMl', Float32Array, simResY), thermo);
   const mlMetrics = computeCAPEForColumn(
-    envTempsC, envDewC, mlProfile, surfaceLevel, isFluid, simResY, dz, sfcAltM, mlProfile._parcelTd);
+    envTempsC, envDewC, mlProfile, surfaceLevel, isFluid, simResY, dz, sfcAltM, mlProfile._parcelTd, thermo);
   const mlCape = mlMetrics.cape;
   const mlCinh = mlMetrics.cinh;
 
@@ -3895,8 +4149,9 @@ function computeColumnSoundingMetricsBody(envTempsC, envDewC, isFluid, vxRaw, vy
   const muStride = lite ? Math.max(1, Math.round(500 / dz)) : 1;
   for (let y = surfaceLevel; y <= muSearchMax; y += muStride) {
     if (!isFluid[y]) continue;
-    const pp = computeParcelProfileForColumn(envTempsC[y], envDewC[y], y, simResY, dz);
-    const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, isFluid, simResY, dz, sfcAltM, envDewC[y]);
+    const pp = computeParcelProfileForColumn(envTempsC[y], envDewC[y], y, simResY, dz,
+      columnThermoScratchView('parcelTmp', Float32Array, simResY), thermo);
+    const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, isFluid, simResY, dz, sfcAltM, envDewC[y], thermo);
     if (m.cape > muCape) {
       muCape = m.cape;
       muCinh = m.cinh;
@@ -3922,8 +4177,9 @@ function computeColumnSoundingMetricsBody(envTempsC, envDewC, isFluid, vxRaw, vy
     const elevOriginMin = surfaceLevel + Math.round(1500 / dz);
     for (let y = elevOriginMin; y <= muSearchMax; y++) {
       if (!isFluid[y]) continue;
-      const pp = computeParcelProfileForColumn(envTempsC[y], envDewC[y], y, simResY, dz);
-      const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, isFluid, simResY, dz, sfcAltM, envDewC[y]);
+      const pp = computeParcelProfileForColumn(envTempsC[y], envDewC[y], y, simResY, dz,
+        columnThermoScratchView('parcelTmp', Float32Array, simResY), thermo);
+      const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, isFluid, simResY, dz, sfcAltM, envDewC[y], thermo);
       if (m.cape > elevatedCape) elevatedCape = m.cape;
     }
 
@@ -3931,8 +4187,9 @@ function computeColumnSoundingMetricsBody(envTempsC, envDewC, isFluid, vxRaw, vy
     const max3kmLevel = surfaceLevel + Math.round(3000 / dz);
     for (let y = surfaceLevel; y < Math.min(max3kmLevel, simResY); y++) {
       if (!isFluid[y]) continue;
-      const pp = computeParcelProfileForColumn(envTempsC[y], envDewC[y], y, simResY, dz);
-      const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, isFluid, simResY, dz, sfcAltM, envDewC[y]);
+      const pp = computeParcelProfileForColumn(envTempsC[y], envDewC[y], y, simResY, dz,
+        columnThermoScratchView('parcelTmp', Float32Array, simResY), thermo);
+      const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, isFluid, simResY, dz, sfcAltM, envDewC[y], thermo);
       if (m.cape3km > cape3km)
         cape3km = m.cape3km;
     }
@@ -4759,6 +5016,15 @@ function prepareOverlayColumnArrays(simResY)
 
 // Incremental map-overlay scan: spread CAPE work across frames so the sim stays responsive.
 const OVERLAY_SCAN_COLS_PER_FRAME = 12;
+
+// The per-column column walk (parcel/CAPE thermodynamics) costs ~10 ms on a default
+// 3000x300 grid, so a 375-column scan is several seconds of JavaScript. Spending that
+// inside one frame froze the app for seconds at a time and starved the simulation.
+// The walk is therefore spread across frames under a wall-clock budget: the results are
+// identical (same columns, same order), they just arrive over the next second or so of
+// frames instead of all at once. At least one column is always processed so a scan can
+// never stall, and the F3 overlay shows the scan budget line.
+const OVERLAY_SCAN_BUDGET_MS_DEFAULT = 2.0;
 var overlayScan = {
   active: false,
   kind: null,
@@ -4776,6 +5042,10 @@ var overlayScan = {
   lastFinishIter: -9999,
   hazardsIfPrecip: false,
   inFlight: null,
+  lastColumnMs: 0,   // EMA of what one scanned column costs
+  frameCount: 0,
+  pacedOut: 0,       // frames the scan gave up to the simulation
+  framesSinceColumn: 0
 };
 
 // One pixel-pack reader per attachment slot of a scan readback.
@@ -4828,6 +5098,8 @@ function promoteOverlayScanFromReadback(inflight)
 {
   overlayScan.inFlight = null;
   overlayScan.active = true;
+  overlayScan.frameCount = 0;
+  overlayScan.pacedOut = 0;
   overlayScan.kind = inflight.kind;
   overlayScan.barW = inflight.barW;
   overlayScan.step = inflight.barW;
@@ -5250,11 +5522,37 @@ function tickOverlayScan()
 {
   if (overlayScan.inFlight && !pollOverlayScanReadback()) return;
   if (!overlayScan.active) return;
+  // One column costs ~10 ms of JavaScript on a default grid. When a frame is already at
+  // or over the target time the scan stays out of the way entirely, so it can only ever
+  // spend the capacity the simulation is not using. Values and column order are
+  // unchanged; the scan just arrives over more frames.
+  if (overlayScanYieldsFrame()) {
+    overlayScan.pacedOut++;
+    overlayScan.framesSinceColumn++;
+    return;
+  }
+  const budgetMs = overlayScanBudgetMs();
+  // A column costs several milliseconds of thermodynamics. Spending it on every frame
+  // would eat the simulation's budget, so when a column costs more than the per-frame
+  // budget the walk runs on only one frame out of `period`. The columns, their order and
+  // their values are unchanged; they just arrive less often.
+  const columnMs = overlayScan.lastColumnMs > 0 ? overlayScan.lastColumnMs : budgetMs;
+  const period = columnMs > budgetMs ? Math.max(1, Math.min(24, Math.ceil(columnMs / budgetMs))) : 1;
+  overlayScan.frameCount++;
+  if (period > 1 && (overlayScan.frameCount % period) !== 0) {
+    overlayScan.pacedOut++;
+    overlayScan.framesSinceColumn++;
+    return;
+  }
   const step = overlayScan.step;
   const dz = guiControls.simHeight / sim_res_y;
   const isRisk = overlayScan.kind === 'risk';
   let processed = 0;
+  const startMs = performance.now();
   while (processed < OVERLAY_SCAN_COLS_PER_FRAME) {
+    // Always run the first column; after that stop once the frame budget is spent.
+    if (processed > 0 && performance.now() - startMs >= budgetMs)
+      break;
     const sx = overlayScan.nextIndex * step;
     if (sx >= sim_res_x) {
       if (isRisk) {
@@ -5288,6 +5586,7 @@ function tickOverlayScan()
       tornadoLastScanIter = iterNum;
       return;
     }
+    const colStartMs = performance.now();
     const metrics = computeOverlayColumnBundle(
       overlayScan.baseAll, overlayScan.waterAll, overlayScan.wallAll,
       overlayScan.needCharge ? overlayScan.chargeAll : null,
@@ -5298,6 +5597,11 @@ function tickOverlayScan()
         hazardsIfPrecip: overlayScan.hazardsIfPrecip,
         needHotspot: overlayScan.needCharge,
       });
+    const colMs = performance.now() - colStartMs;
+    overlayScan.lastColumnMs = overlayScan.lastColumnMs > 0
+      ? overlayScan.lastColumnMs * 0.7 + colMs * 0.3
+      : colMs;
+    overlayScan.framesSinceColumn = 0;
     if (metrics) {
       if (isRisk) {
         const color = convectiveRiskRgba(
@@ -5311,6 +5615,24 @@ function tickOverlayScan()
     overlayScan.nextIndex++;
     processed++;
   }
+}
+
+function overlayScanYieldsFrame()
+{
+  const frameMs = Number(lastFrameTimeMsForScheduling);
+  if (!Number.isFinite(frameMs)) return false;
+  // Comfortable frames, or paused/idle: the scan may work. Clearly over target: yield to
+  // the simulation — but never for long, or a grid that never reaches the target would
+  // leave the overlay unrefreshed forever.
+  if (frameMs <= TARGET_FRAME_MS * 1.5) return false;
+  return overlayScan.framesSinceColumn < 90;
+}
+
+function overlayScanBudgetMs()
+{
+  const v = Number(guiControls && guiControls.overlayScanBudgetMs);
+  if (!Number.isFinite(v)) return OVERLAY_SCAN_BUDGET_MS_DEFAULT;
+  return clamp(v, 0.5, 12);
 }
 
 function shouldRestartOverlayScan(kind, barW)
@@ -18451,12 +18773,23 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       const columnKey = balloonHasPathSamples
         ? ('balloon|' + skewTBalloon.getSamples().length + '|' + colXRead)
         : (colXRead + '|' + (even ? 1 : 0));
+      // The analysis key covers everything the analysis below depends on besides the column
+      // data itself, so a grid or pressure-mode change can never reuse a stale result.
+      const analysisKey = columnKey + '|' + sim_res_y + '|' + guiControls.simHeight
+        + '|' + (guiControls.useHydrostaticCapePressure === false ? 0 : 1);
+      // The analysis is refreshed at a bounded rate: while it is held, the column readback it
+      // belongs to is held with it, so the graph always shows one consistent snapshot (curves
+      // and numbers from the same column). Moving to another column is picked up within 40 ms,
+      // a stable column refreshes every ~110 ms. Nothing is dropped: the same analysis is
+      // recomputed for the same column, just not on every frame.
+      const refreshAnalysis = shouldRefreshSoundingAnalysis(this._soundingAnalysis, analysisKey, performance.now(), lightSkewT);
+      const holdSnapshot = !refreshAnalysis;
       const reuseColumn = !balloonHasPathSamples
-        && this._columnCacheKey === columnKey
-        && this._columnCacheFrame >= frameNum - 1
         && this._columnBaseValues
         && this._columnWaterValues
-        && this._columnWallValues;
+        && this._columnWallValues
+        && ((this._columnCacheKey === columnKey && this._columnCacheFrame >= frameNum - 1)
+          || (holdSnapshot && this._columnCacheFrame >= frameNum - SOUNDING_ANALYSIS_MAX_AGE_FRAMES));
       let baseTextureValues;
       let waterTextureValues;
       let wallTextureValues;
@@ -18702,13 +19035,27 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
 
       var c = this.ctx;
 
-      function computeParcelProfile(surfaceTempC, surfaceTdC, startIndex) {
+      function computeParcelProfileInto(outProfile, surfaceTempC, surfaceTdC, startIndex) {
         const dzLocal = guiControls.simHeight / sim_res_y;
-        return computeParcelProfileForColumn(surfaceTempC, surfaceTdC, startIndex, sim_res_y, dzLocal);
+        return computeParcelProfileForColumn(surfaceTempC, surfaceTdC, startIndex, sim_res_y, dzLocal, outProfile, thermo);
       }
 
+      // Fresh array: the surface parcel profile is kept for the rest of the draw.
+      function computeParcelProfile(surfaceTempC, surfaceTdC, startIndex) {
+        return computeParcelProfileInto(new Float32Array(sim_res_y), surfaceTempC, surfaceTdC, startIndex);
+      }
+
+      // Candidate parcels in the MU / elevated / 0-3 km searches are consumed immediately
+      // by the metrics call, so they share one grow-only scratch buffer.
+      function computeParcelProfileScratch(surfaceTempC, surfaceTdC, startIndex) {
+        return computeParcelProfileInto(
+          columnThermoScratchView('graphParcel', Float32Array, sim_res_y), surfaceTempC, surfaceTdC, startIndex);
+      }
+
+      // The mean-layer profile is also kept for the rest of the draw, in its own slot.
       function meanLayerParcel(envTempsC, envDewC, startIndex) {
-        return meanLayerParcelForColumn(envTempsC, envDewC, startIndex, sim_res_y, dz);
+        return meanLayerParcelForColumn(envTempsC, envDewC, startIndex, sim_res_y, dz,
+          columnThermoScratchView('graphMl', Float32Array, sim_res_y), thermo);
       }
 
       // Compute sounding stability metrics for skew-T readout
@@ -18730,6 +19077,9 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       if (skewTBalloon) {
         skewTBalloon.populateEnvFromSamples(envTempsC, envDewC, baseTextureValues, waterTextureValues);
       }
+      // Per-level pressure and environmental virtual temperature for this column, built once
+      // and shared by every parcel/CAPE call below (they would each recompute both per level).
+      const thermo = buildColumnThermoCache(envTempsC, envDewC, sim_res_y, dz);
       const columnIsFluid = new Array(sim_res_y);
       if (balloonPathSamples && balloonPathSamples.length) {
         columnIsFluid.fill(false);
@@ -18805,30 +19155,54 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       }
       const altToHpa = (alt_m) => skewHpaFromAltM(alt_m);
       const parcelProfile = computeParcelProfile(envTempsC[surfaceLevel], envDewC[surfaceLevel], surfaceLevel);
-      const soundingMetrics = lightSkewT
-        ? { cape: 0, cinh: NaN, lclAlt: NaN, lfcAlt: NaN, elAlt: NaN }
-        : computeCAPEForColumn(
-          envTempsC, envDewC, parcelProfile, surfaceLevel, columnIsFluid, sim_res_y, dz, sfcAltM,
-          envDewC[surfaceLevel]);
+      let soundingMetrics;
+      let meanParcelProfile;
+      let meanLayerMetrics;
+      let muCape, muCinh, muLcl, muLfc, muEl, muParcelLevel;
+      let elevatedCape, cape3km, liftedIndex, freezingAlt;
+      if (holdSnapshot) {
+        // Still inside the refresh window: reuse the numbers computed for this column. The
+        // readback above was reused to match, so curves and numbers stay consistent.
+        const c = cachedAnalysis;
+        soundingMetrics = c.soundingMetrics;
+        meanParcelProfile = c.meanParcelProfile;
+        meanLayerMetrics = c.meanLayerMetrics;
+        muCape = c.muCape;
+        muCinh = c.muCinh;
+        muLcl = c.muLcl;
+        muLfc = c.muLfc;
+        muEl = c.muEl;
+        muParcelLevel = c.muParcelLevel;
+        elevatedCape = c.elevatedCape;
+        cape3km = c.cape3km;
+        liftedIndex = c.liftedIndex;
+        freezingAlt = c.freezingAlt;
+      } else {
+        soundingMetrics = lightSkewT
+          ? { cape: 0, cinh: NaN, lclAlt: NaN, lfcAlt: NaN, elAlt: NaN }
+          : computeCAPEForColumn(
+            envTempsC, envDewC, parcelProfile, surfaceLevel, columnIsFluid, sim_res_y, dz, sfcAltM,
+            envDewC[surfaceLevel], thermo);
+        meanParcelProfile = parcelProfile;
+        meanLayerMetrics = soundingMetrics;
+        muCape = 0;
+        muCinh = soundingMetrics.cinh;
+        muLcl = soundingMetrics.lclAlt;
+        muLfc = soundingMetrics.lfcAlt;
+        muEl = soundingMetrics.elAlt;
+        muParcelLevel = surfaceLevel;
+        elevatedCape = 0;
+        cape3km = 0;
+        liftedIndex = NaN;
+        freezingAlt = NaN;
+      }
       const sbCape = soundingMetrics.cape;
-      let meanParcelProfile = parcelProfile;
-      let meanLayerMetrics = soundingMetrics;
-      let muCape = 0;
-      let muCinh = soundingMetrics.cinh;
-      let muLcl = soundingMetrics.lclAlt;
-      let muLfc = soundingMetrics.lfcAlt;
-      let muEl = soundingMetrics.elAlt;
-      let muParcelLevel = surfaceLevel;
-      let elevatedCape = 0;
-      let cape3km = 0;
-      let liftedIndex = NaN;
-      let freezingAlt = NaN;
 
-      if (!lightSkewT) {
+      if (!lightSkewT && !holdSnapshot) {
       meanParcelProfile = meanLayerParcel(envTempsC, envDewC, surfaceLevel);
       meanLayerMetrics = computeCAPEForColumn(
         envTempsC, envDewC, meanParcelProfile, surfaceLevel, columnIsFluid, sim_res_y, dz, sfcAltM,
-        meanParcelProfile._parcelTd);
+        meanParcelProfile._parcelTd, thermo);
 
       // Most Unstable CAPE: max CAPE among parcels in the lowest ~3 km (standard MU depth)
       muCape = 0;
@@ -18846,8 +19220,8 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
         }
         for (const y of sampleLevels) {
           if (!columnIsFluid[y]) continue;
-          const pp = computeParcelProfile(envTempsC[y], envDewC[y], y);
-          const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, columnIsFluid, sim_res_y, dz, sfcAltM, envDewC[y]);
+          const pp = computeParcelProfileScratch(envTempsC[y], envDewC[y], y);
+          const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, columnIsFluid, sim_res_y, dz, sfcAltM, envDewC[y], thermo);
           if (m.cape > muCape) {
             muCape = m.cape;
             muCinh = m.cinh;
@@ -18858,19 +19232,19 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
           }
         }
       } else {
-      for (let y = surfaceLevel; y <= muSearchMax; y++) {
-        if (!isFluidAt(y)) continue;
-        const pp = computeParcelProfile(envTempsC[y], envDewC[y], y);
-        const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, columnIsFluid, sim_res_y, dz, sfcAltM, envDewC[y]);
-        if (m.cape > muCape) {
-          muCape = m.cape;
-          muCinh = m.cinh;
-          muLcl = m.lclAlt;
-          muLfc = m.lfcAlt;
-          muEl = m.elAlt;
-          muParcelLevel = y;
-        }
+      // MU / elevated-parcel / 0-3 km CAPE searches in one pass over the candidate levels.
+      const parcelSearches = computeColumnParcelSearches(
+        envTempsC, envDewC, columnIsFluid, isFluidAt, sim_res_y, dz, sfcAltM, surfaceLevel, muSearchMax, thermo);
+      if (parcelSearches.muParcelLevel >= 0) {
+        muCape = parcelSearches.muCape;
+        muCinh = parcelSearches.muCinh;
+        muLcl = parcelSearches.muLcl;
+        muLfc = parcelSearches.muLfc;
+        muEl = parcelSearches.muEl;
+        muParcelLevel = parcelSearches.muParcelLevel;
       }
+      elevatedCape = parcelSearches.elevatedCape;
+      cape3km = parcelSearches.cape3km;
       }
       if (muCape < sbCape) {
         muCape = sbCape;
@@ -18879,24 +19253,6 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
         muLfc = soundingMetrics.lfcAlt;
         muEl = soundingMetrics.elAlt;
         muParcelLevel = surfaceLevel;
-      }
-
-      elevatedCape = 0;
-      const elevOriginMin = surfaceLevel + Math.round(1500 / dz);
-      for (let y = elevOriginMin; y <= muSearchMax; y++) {
-        if (!isFluidAt(y)) continue;
-        const pp = computeParcelProfile(envTempsC[y], envDewC[y], y);
-        const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, columnIsFluid, sim_res_y, dz, sfcAltM, envDewC[y]);
-        if (m.cape > elevatedCape) elevatedCape = m.cape;
-      }
-
-      cape3km = 0;
-      const max3kmLevel = surfaceLevel + Math.round(3000 / dz);
-      for (let y = surfaceLevel; y < Math.min(max3kmLevel, sim_res_y); y++) {
-        if (!isFluidAt(y)) continue;
-        const pp = computeParcelProfile(envTempsC[y], envDewC[y], y);
-        const m = computeCAPEForColumn(envTempsC, envDewC, pp, y, columnIsFluid, sim_res_y, dz, sfcAltM, envDewC[y]);
-        if (m.cape3km > cape3km) cape3km = m.cape3km;
       }
 
       // Lifted Index: difference between parcel temp and env temp at 500mb (~5.5km)
@@ -18925,6 +19281,23 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       if (isNaN(freezingAlt) && envTempsC[surfaceLevel] <= 0) {
         freezingAlt = surfaceLevel * dz;
       }
+      this._soundingAnalysis = {
+        key : analysisKey,
+        timeMs : performance.now(),
+        soundingMetrics : soundingMetrics,
+        meanParcelProfile : meanParcelProfile,
+        meanLayerMetrics : meanLayerMetrics,
+        muCape : muCape,
+        muCinh : muCinh,
+        muLcl : muLcl,
+        muLfc : muLfc,
+        muEl : muEl,
+        muParcelLevel : muParcelLevel,
+        elevatedCape : elevatedCape,
+        cape3km : cape3km,
+        liftedIndex : liftedIndex,
+        freezingAlt : freezingAlt,
+      };
       }
       const muParcelAgl = (muParcelLevel - surfaceLevel) * dz;
 
@@ -22185,6 +22558,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   {
     // Faster EMA (0.80 vs old 0.88) so the auto-iter controller reacts in ~5 frames instead of ~8
     smoothedFrameMs = smoothedFrameMs * 0.80 + frameMs * 0.20;
+    lastFrameTimeMsForScheduling = smoothedFrameMs;
     beginGlStateFrameStats();
   }
 
@@ -30594,6 +30968,15 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       'Paused: ' + (guiControls.paused ? 'yes' : 'no')
         + '  precip=' + (guiControls.enablePrecipitation ? 'on' : 'off')
         + '  bloom=' + (guiControls.enableBloom ? 'on' : 'off'),
+      'Snd scan: ' + (overlayScan.active
+          ? Math.min(sim_res_x, overlayScan.nextIndex * overlayScan.step) + '/' + sim_res_x + ' px'
+          : 'idle')
+        + '  col ' + overlayScan.lastColumnMs.toFixed(1) + ' ms'
+        + '  budget ' + overlayScanBudgetMs().toFixed(1) + ' ms'
+        + '  paced ' + overlayScan.pacedOut + ' frames',
+      'Skew-T: ' + (soundingGraph._soundingAnalysis
+          ? (performance.now() - soundingGraph._soundingAnalysis.timeMs).toFixed(0) + ' ms since analysis'
+          : 'no analysis'),
       'Lightning: ' + boltCount + ' bolts  style=' + lightningStyle
         + '  LOD=' + (guiControls.dynamicLOD ? 'on' : 'off'),
       'Sun: ' + (guiControls.sunAngle != null ? guiControls.sunAngle.toFixed(1) : '?') + '°'

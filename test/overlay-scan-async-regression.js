@@ -207,10 +207,17 @@ function buildSandbox(simResX, simResY)
   sandbox.globalThis = sandbox;
   const code = []
     .concat('const OVERLAY_SCAN_COLS_PER_FRAME = 12;')
+    .concat('const OVERLAY_SCAN_BUDGET_MS_DEFAULT = 2.0;')
+    .concat('const TARGET_FRAME_MS = 28;')
+    // Frame time is unknown in this harness, which makes the scan never yield to the frame.
+    .concat('var lastFrameTimeMsForScheduling = undefined;')
+    .concat('var performance = { now : () => Date.now() };')
+    .concat('function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }')
     .concat(extractBlock(appSource, 'var overlayScan = {'))
     .concat(extractBlock(appSource, 'var overlayScanReaders = [];'))
     .concat(appSource.match(/const OVERLAY_SCAN_READBACK_MAX_FRAMES = \d+;/)[0])
-    .concat(FUNCTIONS.map((name) => extractFunction(appSource, name)))
+    .concat(FUNCTIONS.concat([ 'overlayScanYieldsFrame', 'overlayScanBudgetMs' ])
+      .map((name) => extractFunction(appSource, name)))
     .join('\n');
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
@@ -312,4 +319,63 @@ function advanceFrames(sandbox, frames)
   assert.strictEqual(sandbox.overlayScan.active, false, 'restarting clears the active scan');
 }
 
-console.log('Overlay scan async readback regression test passed (6 scenarios)');
+// 7. Frame pacing: a column that costs more than the per-frame budget is spread over
+//    several frames, and the columns visited (and their order) are unchanged.
+{
+  const sandbox = buildSandbox(64, 8);
+  const seen = [];
+  sandbox.computeOverlayColumnBundle = (baseAll, waterAll, wallAll, chargeAll, sx) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3) { /* pretend a column costs ~3 ms */ }
+    seen.push(sx);
+    return null;
+  };
+  vm.runInContext("beginOverlayScan('risk', false, false, frameBuff_1, chargeFrameBuff_1);", sandbox);
+  advanceFrames(sandbox, 1);   // collect the readback, then walk within the budget
+  assert.ok(seen.length >= 1, 'the tick that lands the readback must process at least one column');
+  const firstTickColumns = seen.length;
+  assert.ok(sandbox.overlayScan.active, 'the scan must still be running');
+  let ticks = 0;
+  while (sandbox.overlayScan.active && ticks < 400) { advanceFrames(sandbox, 1); ticks++; }
+  assert.ok(!sandbox.overlayScan.active, 'the scan must finish');
+  const step = sandbox.overlayScan.step;
+  const expected = [];
+  for (let i = 0; i * step < 64; i++) expected.push(i * step);
+  assert.deepStrictEqual(seen, expected, 'paced scans must visit exactly the same columns in the same order');
+  const remaining = expected.length - firstTickColumns;
+  assert.ok(ticks >= remaining - 1 && ticks <= 2 * remaining + 4,
+    'a ~3 ms column under a 2 ms budget must take about two ticks per column (took ' + ticks + ' for ' + remaining + ')');
+  assert.ok(sandbox.overlayScan.pacedOut > 0, 'the scan must report the frames it gave up');
+  assert.ok(sandbox.overlayScan.lastColumnMs >= 2,
+    'the measured column cost should feed the pacing (' + sandbox.overlayScan.lastColumnMs + ' ms)');
+}
+
+// 8. A column budget larger than the column cost keeps the original every-frame cadence.
+{
+  const sandbox = buildSandbox(64, 8);
+  sandbox.guiControls.overlayScanBudgetMs = 50;
+  vm.runInContext("beginOverlayScan('risk', false, false, frameBuff_1, chargeFrameBuff_1);", sandbox);
+  advanceFrames(sandbox, 1);
+  assert.strictEqual(sandbox.overlayScan.nextIndex, 12, 'cheap columns must not be paced');
+  assert.strictEqual(sandbox.overlayScan.pacedOut, 0, 'nothing may be given up when there is headroom');
+}
+
+// 9. Heavy frames: the scan steps aside, but never long enough to leave the overlay stale.
+{
+  const sandbox = buildSandbox(64, 8);
+  sandbox.computeOverlayColumnBundle = () => null;
+  vm.runInContext("beginOverlayScan('risk', false, false, frameBuff_1, chargeFrameBuff_1);", sandbox);
+  advanceFrames(sandbox, 1);
+  const landedAt = sandbox.overlayScan.nextIndex;
+  vm.runInContext('lastFrameTimeMsForScheduling = 60;', sandbox);   // well over target
+  advanceFrames(sandbox, 89);
+  assert.strictEqual(sandbox.overlayScan.nextIndex, landedAt, 'over-target frames must not spend time on the scan');
+  advanceFrames(sandbox, 2);
+  assert.ok(sandbox.overlayScan.nextIndex > landedAt,
+    'the starvation guard must let a column through after 90 frames');
+  vm.runInContext('lastFrameTimeMsForScheduling = 16;', sandbox);
+  advanceFrames(sandbox, 1);
+  assert.ok(sandbox.overlayScan.nextIndex > landedAt, 'comfortable frames resume the normal cadence');
+}
+
+console.log('Overlay scan async readback regression test passed (9 scenarios)');
