@@ -112,7 +112,7 @@ function serveIndexHtml(res) {
     if (body.includes(marker))
       body = body.replace(marker, inject + marker);
   }
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control' : 'no-store' });
   res.end(body);
 }
 
@@ -129,7 +129,13 @@ function serveFile(res, filePath) {
     }
     const ext = path.extname(filePath).toLowerCase();
     const type = MIME[ext] || 'application/octet-stream';
-    res.writeHead(200, { 'Content-Type': type });
+    // Code and markup are revalidated on every load so a reload always picks up the
+    // current build (a cached app.js silently hiding a fix is worse than the saved
+    // bytes); binary media stays cacheable.
+    const headers = { 'Content-Type': type };
+    if (ext === '.js' || ext === '.mjs' || ext === '.html' || ext === '.css' || ext === '.json')
+      headers['Cache-Control'] = 'no-store';
+    res.writeHead(200, headers);
     fs.createReadStream(filePath).pipe(res);
   });
 }

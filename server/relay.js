@@ -8,7 +8,14 @@
 'use strict';
 
 const crypto = require('crypto');
-const { WebSocketServer } = require('ws');
+// The multiplayer relay needs `ws`. The static server and the single-player simulation do
+// not, so a missing optional dependency must not stop the app from being served.
+let WebSocketServer = null;
+try {
+  ({ WebSocketServer } = require('ws'));
+} catch (e) {
+  WebSocketServer = null;
+}
 
 const BINARY_SNAPSHOT = 0x01;
 const BINARY_TEXTURE_SYNC = 0x02;
@@ -169,6 +176,11 @@ function allowRate(ws, kind, cost) {
  * @returns {{ wss: WebSocketServer, stop: () => void }}
  */
 function attachMultiplayerRelay(httpServer) {
+  if (!WebSocketServer) {
+    console.warn('Multiplayer relay disabled: the optional "ws" package is not installed '
+      + '(npm install). The simulation and static server are unaffected.');
+    return null;
+  }
   const wss = new WebSocketServer({
     server: httpServer,
     maxPayload: MAX_PAYLOAD,
