@@ -170,8 +170,20 @@ function profHandler(req, res) {
   });
 }
 
+const loggedOnce = new Set();
 function staticHandler(req, res) {
   const pathname = (req.url || '').split('?')[0];
+  // Log the first request for the document and the main script of each client address so a
+  // reload can be confirmed from the server side; everything else stays quiet.
+  if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html' || pathname === '/app.js')) {
+    const ip = (req.socket && req.socket.remoteAddress) || '?';
+    const key = ip + ' ' + pathname;
+    if (!loggedOnce.has(key)) {
+      loggedOnce.add(key);
+      if (loggedOnce.size > 400) loggedOnce.clear();
+      console.log('[served] ' + pathname + ' to ' + ip + ' (first time from this address)');
+    }
+  }
   if (pathname === '/api/frame-profile' || pathname === '/api/frame-profile/') {
     profHandler(req, res);
     return;

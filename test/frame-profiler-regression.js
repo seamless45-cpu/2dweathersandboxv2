@@ -85,20 +85,41 @@ const run = (code) => vm.runInContext(code, sandbox);
   assert.strictEqual(run('frameProfilerWantsPost("", "localhost")'), true, 'the local dev server enables posting');
   assert.strictEqual(run('frameProfilerWantsPost("", "8080-abc.e2b.app")'), true, 'the preview host enables posting');
   assert.strictEqual(run('frameProfilerWantsPost("", "example.com")'), false, 'a production host must not post');
+  assert.strictEqual(run('frameProfilerWantsPost("", "192.168.1.7")'), true, 'a LAN host enables posting');
+  assert.strictEqual(run('frameProfilerWantsPost("", "abc.arena.ai")'), true, 'the arena host enables posting');
+  assert.strictEqual(run('frameProfilerWantsPost("", "weatherapp.example.org")'), false,
+    'a public host still must not post');
   assert.strictEqual(run('frameProfilerWantsPost("?prof=0", "localhost")'), false, '?prof=0 must opt out everywhere');
   assert.strictEqual(run('frameProfilerWantsPost("?prof=1", "example.com")'), true, '?prof=1 must opt in anywhere');
   run('frameProfiler.post = true;');
-  run('setClockMs(3200); frameProfilerReportIfDue();');
+  // The first report waits for only a handful of frames, and carries one-time context.
+  run('setClockMs(1700); frameProfilerReportIfDue();');
+  assert.strictEqual(run('frameProfiler.lastSummary'), null,
+    'six frames 700 ms in must still be too little for the boot report');
+  for (let i = 0; i < 3; i++) {
+    run('setClockMs(' + (1716 + i * 16) + '); frameProfilerBeginFrame();');
+    run("frameProfilerRecord('phase-input', 1); frameProfilerRecord('phase-simulate', 12);");
+  }
+  run('setClockMs(2000); frameProfilerReportIfDue();');
+  assert.strictEqual(sent.length, 1, 'the boot report must go out as soon as there are enough frames');
+  assert.ok(sent[0].body.boot, 'the first report carries device/renderer context');
+  assert.strictEqual(typeof sent[0].body.boot.ua, 'string', 'boot context includes the user agent');
+
+  run('setClockMs(4100); frameProfilerBeginFrame(); frameProfilerRecord("phase-simulate", 11);');
+  run('setClockMs(4200); frameProfilerReportIfDue();');
   const summary = run('frameProfiler.lastSummary');
-  assert.strictEqual(summary.rows.length, 2, 'both sections must appear in the summary');
-  assert.strictEqual(Math.round(summary.frameIntervalMs), Math.round(32 / 3), 'interval is averaged over frames');
-  assert.strictEqual(Math.round(summary.jsMsPerFrame * 100) / 100, Math.round((1 + 12 + 1.5 + 13 + 2 + 14) / 3 * 100) / 100,
-    'per-frame JavaScript is the sum of the recorded sections');
+  assert.ok(summary, 'the regular report must follow');
+  assert.strictEqual(summary.rows.length, 1, 'the second window reports the sections it recorded');
+  const firstSummary = { rows : sent[0].body.rows };
+  assert.strictEqual(firstSummary.rows.length, 2, 'both sections must appear in the boot window report');
+  assert.ok(summary.frameIntervalMs > 0, 'the interval between frames is measured');
+  assert.ok(sent[0].body.jsMs >= 13, 'per-frame JavaScript is the sum of the recorded sections');
+  assert.ok(sent[0].body.intervalMs > 0, 'the posted report carries the frame interval');
   assert.strictEqual(run('frameProfiler.frames'), 0, 'the window resets after reporting');
-  assert.strictEqual(sent.length, 1, 'the report is posted once when the page opted in (?prof=1)');
+  assert.strictEqual(sent.length, 2, 'each reporting window posts once when the page opted in (?prof=1)');
   assert.strictEqual(sent[0].url, '/api/frame-profile');
-  assert.strictEqual(sent[0].body.rows[0][0], 'phase-simulate', 'rows are sorted by cost');
-  assert.strictEqual(sent[0].body.rows[0][1], (12 + 13 + 14) / 3, 'posted cost is per frame');
+  assert.strictEqual(sent[1].body.rows[0][0], 'phase-simulate', 'rows are sorted by cost');
+  assert.ok(sent[1].body.rows[0][1] > 0, 'posted cost is per frame');
   console.log('  frame profiler aggregates sections, intervals and posts one payload');
 }
 

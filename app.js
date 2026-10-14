@@ -1976,6 +1976,8 @@ var frameProfiler = {
   windowStartMs : 0,
   lastSummary : null,
   lastPostMs : 0,
+  bootPosted : false,
+  bootInfo : null,
   frameStartMs : 0,
   intervalMs : 0,
   intervalMsMax : 0,
@@ -2004,8 +2006,17 @@ function frameProfilerWantsPost(search, hostname)
   const query = String(search || '');
   if (/[?&]prof=0(?:&|$)/.test(query)) return false;
   if (/[?&]prof(?:=|&|$)/.test(query)) return true;
-  const host = String(hostname || '');
-  return host === 'localhost' || host === '127.0.0.1' || /\.e2b\.app$/.test(host);
+  const host = String(hostname || '').toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '[::1]')
+    return true;
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host))          // any IPv4 host (dev machines, LAN previews)
+    return true;
+  return /\.e2b\.(?:app|dev)$/.test(host)
+    || /\.arena\.(?:ai|dev)$/.test(host)
+    || /\.ngrok(?:-free)?\.(?:io|app)$/.test(host)
+    || /\.trycloudflare\.com$/.test(host)
+    || /\.local$/.test(host);
 }
 
 function frameProfilerBeginFrame()
@@ -2077,12 +2088,53 @@ function frameProfilerSummaryLines()
     + 'js ' + s.jsMsPerFrame.toFixed(1) + ' ms  |  ' + top;
 }
 
+// One-time context for the first report: what the client is, what the renderer is, and how
+// the app is configured. Lets a slow frame be diagnosed without access to the device.
+function frameProfilerCollectBootInfo()
+{
+  const info = {
+    ua : String((navigator && navigator.userAgent) || ''),
+    dpr : (typeof devicePixelRatio === 'number' ? devicePixelRatio : 1),
+    screen : (typeof screen !== 'undefined' ? (screen.width + 'x' + screen.height) : '?'),
+    viewport : (typeof innerWidth === 'number' ? (innerWidth + 'x' + innerHeight) : '?'),
+    touch : !!(navigator && navigator.maxTouchPoints > 0),
+    cores : (navigator && navigator.hardwareConcurrency) || 0,
+    memGb : (navigator && navigator.deviceMemory) || 0,
+    webgl : '?',
+    webgl2 : false,
+  };
+  try {
+    if (typeof gl !== 'undefined' && gl) {
+      info.webgl2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      if (dbg)
+        info.webgl = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+      else
+        info.webgl = String(gl.getParameter(gl.RENDERER));
+    }
+  } catch (e) { /* probing must never break the frame */ }
+  try {
+    info.grid = sim_res_x + 'x' + sim_res_y + ' h' + guiControls.simHeight;
+    info.iters = guiControls.IterPerFrame;
+    info.hdr = (typeof hdrRenderScaleState === 'number' ? hdrRenderScaleState : 1);
+    info.lite = (typeof useLiteVisualsMode === 'function' && useLiteVisualsMode()) || false;
+    info.hiResPerf = !!guiControls.highResPerformanceMode;
+    info.canvas = canvas.width + 'x' + canvas.height;
+    info.displayMode = guiControls.displayMode;
+  } catch (e) { /* optional */ }
+  return info;
+}
+
 function frameProfilerReportIfDue()
 {
   const now = performance.now();
   if (frameProfiler.windowStartMs === 0 || frameProfiler.frames < 1)
     return;
-  if (now - frameProfiler.windowStartMs < 2000)
+  // The very first report goes out as soon as there is a handful of frames, so a slow or
+  // failing page is visible in the server log within a second of loading.
+  const minWindowMs = frameProfiler.bootPosted ? 2000 : 600;
+  const minFrames = frameProfiler.bootPosted ? 1 : 5;
+  if (frameProfiler.frames < minFrames || now - frameProfiler.windowStartMs < minWindowMs)
     return;
   const frames = frameProfiler.frames;
   const rows = [];
@@ -2099,8 +2151,13 @@ function frameProfilerReportIfDue()
   };
   if (frameProfiler.post) {
     try {
+      if (!frameProfiler.bootPosted) {
+        frameProfiler.bootPosted = true;
+        frameProfiler.bootInfo = frameProfilerCollectBootInfo();
+      }
       fetch('/api/frame-profile', { method : 'POST', headers : { 'Content-Type' : 'application/json' },
-        body : JSON.stringify({ fps : frameProfiler.lastSummary.fps,
+        body : JSON.stringify({ boot : frameProfiler.bootInfo || undefined,
+          fps : frameProfiler.lastSummary.fps,
           intervalMs : frameProfiler.lastSummary.frameIntervalMs,
           intervalMaxMs : frameProfiler.lastSummary.frameIntervalMsMax,
           jsMs : jsMs, iters : (typeof guiControls !== 'undefined' && guiControls.IterPerFrame) | 0,
