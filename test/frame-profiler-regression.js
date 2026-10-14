@@ -142,4 +142,47 @@ const run = (code) => vm.runInContext(code, sandbox);
   console.log('  profiler bookkeeping tolerates missing and invalid timings');
 }
 
+// 4. Display refresh pacing: the controller must aim at whole refresh intervals so it
+//    cannot oscillate between "grow" and "cut" on every frame.
+{
+  const tune = (smoothed, period) => run('autoTuneTargetMs(' + smoothed + ', ' + period + ')');
+  assert.strictEqual(tune(16.7, 16.7), 16.7, 'a one-refresh frame aims at one refresh');
+  assert.strictEqual(tune(33.3, 16.7), 33.4, 'a two-refresh frame aims at two refreshes');
+  assert.strictEqual(tune(1000, 16.7), 33.4,
+    'a frame many refreshes long still aims at a whole refresh count, not a fractional one');
+  assert.ok(1000 - tune(1000, 16.7) > 900,
+    'and it stays far over budget, so the cut branch keeps reducing the load');
+  assert.strictEqual(tune(8.3, 8.3), 8.3, 'a 120 Hz panel settles on one 8.3 ms refresh');
+  assert.strictEqual(tune(16.7, 33.3), 33.3, 'a 30 Hz panel settles on one 33.3 ms refresh');
+  // The point of the policy: neither branch may fire for a frame that is exactly on target.
+  const hold = (period) => {
+    const smoothed = period * 2;
+    const over = smoothed - tune(smoothed, period);
+    return over;
+  };
+  assert.ok(Math.abs(hold(16.7)) < 0.2, 'a two-refresh frame is exactly on target, not over it');
+  assert.ok(Math.abs(hold(8.3)) < 0.2, 'the same holds on a 120 Hz panel');
+
+  // Period measurement cannot creep upward: a device that is merely busy must never be
+  // mistaken for a slow panel, or the target would relax until the sim crawls.
+  run('displayRefreshPeriodMs = 16.7; displayRefreshMinMs = 16.7;');
+  for (let i = 0; i < 120; i++) run('noteFrameIntervalForPacing(33.3)');
+  assert.ok(Math.abs(run('displayRefreshPeriodMs') - 16.7) < 0.01,
+    'a window of slow frames must not raise the measured period');
+  assert.strictEqual(tune(33.3, run('displayRefreshPeriodMs')), 33.4,
+    'and the target stays at two refreshes, not three');
+  // A 30 Hz panel is recognised because no frame can ever be faster than 33 ms.
+  run('displayRefreshPeriodMs = 33.3; displayRefreshMinMs = 33.3;');
+  for (let i = 0; i < 120; i++) run('noteFrameIntervalForPacing(33.3)');
+  assert.ok(Math.abs(run('displayRefreshPeriodMs') - 33.3) < 0.5, 'a 30 Hz panel measures 33.3 ms');
+  assert.strictEqual(tune(33.3, 33.3), 33.3, 'and a one-refresh frame targets one refresh');
+  // A genuinely faster panel is picked up: the estimate only ever moves down.
+  run('displayRefreshPeriodMs = 33.3; displayRefreshMinMs = 33.3;');
+  for (let i = 0; i < 300; i++) run('noteFrameIntervalForPacing(16.7)');
+  assert.ok(run('displayRefreshPeriodMs') < 18,
+    'a 60 Hz panel is recognised within a few windows (got ' + run('displayRefreshPeriodMs') + ')');
+  run('noteFrameIntervalForPacing(NaN); noteFrameIntervalForPacing(-5); noteFrameIntervalForPacing(99999);');
+  console.log('  display refresh pacing aims at whole refresh intervals');
+}
+
 console.log('Frame profiler regression test passed');

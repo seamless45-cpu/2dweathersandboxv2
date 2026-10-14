@@ -1948,6 +1948,56 @@ const SOUNDING_ANALYSIS_MIN_INTERVAL_MS = 40;
 const SOUNDING_ANALYSIS_MAX_INTERVAL_MS = 110;
 const SOUNDING_ANALYSIS_MAX_AGE_FRAMES = 24;
 
+// ---------------------------------------------------------------------------
+// Display refresh pacing
+// ---------------------------------------------------------------------------
+// The auto-iteration controller compares the smoothed frame time against a target. If that
+// target is not a whole number of display refreshes, the controller can never be satisfied:
+// on a 60 Hz screen every frame takes 1, 2, 3, ... refresh intervals (16.7 / 33.3 / 50 ms),
+// so a 28 ms target means "grow the workload" at 16.7 ms and "cut it" at 33.3 ms, forever.
+// The result is an iter-count that oscillates and frames that alternate between one and two
+// refresh intervals — visible as stutter even when the average frame rate looks fine.
+//
+// The refresh period is therefore measured from the fastest recent frame interval, and the
+// controller targets a whole number of refreshes: settle on one refresh when the workload
+// fits, otherwise hold at two and only cut beyond that. The workload (and everything it
+// computes) is unchanged; only the equilibrium the controller aims for is.
+var displayRefreshPeriodMs = 16.7;
+var displayRefreshMinMs = 16.7;      // fastest interval seen in the current window
+var displayRefreshWindowFrames = 0;
+const DISPLAY_REFRESH_MIN_MS = 8.2;  // 120 Hz ceiling
+const DISPLAY_REFRESH_MAX_MS = 34;   // treat anything slower as 30 Hz
+
+function noteFrameIntervalForPacing(intervalMs)
+{
+  if (!(intervalMs > 0) || intervalMs > 500) return;
+  if (intervalMs < displayRefreshMinMs) displayRefreshMinMs = intervalMs;
+  if (++displayRefreshWindowFrames >= 30) {
+    displayRefreshWindowFrames = 0;
+    // The fastest frame in the window is the best evidence for the panel's interval, and it
+    // is folded in gradually so one lucky frame cannot retime the controller. Because the
+    // window minimum starts at the current period, this can only ever make the estimate
+    // faster — a busy device is never mistaken for a slow panel, and the period cannot
+    // creep upward until the target becomes unplayable.
+    const measured = clamp(displayRefreshMinMs, DISPLAY_REFRESH_MIN_MS, DISPLAY_REFRESH_MAX_MS);
+    displayRefreshPeriodMs = displayRefreshPeriodMs + (measured - displayRefreshPeriodMs) * 0.5;
+    displayRefreshMinMs = displayRefreshPeriodMs;
+  }
+}
+
+// The frame time the controller aims to hold. Pure function so the policy is testable.
+function autoTuneTargetMs(smoothedFrameMs, refreshPeriodMs)
+{
+  const period = clamp(refreshPeriodMs, DISPLAY_REFRESH_MIN_MS, DISPLAY_REFRESH_MAX_MS);
+  // A workload that fits inside one refresh aims at exactly one refresh (60 fps on a
+  // 60 Hz panel, 120 on a 120 Hz panel). Anything heavier aims at the next whole number of
+  // refreshes, capped at 30 fps: below that the sim would crawl, and the cut branch is the
+  // better answer. Either way the target is a whole refresh interval, so the controller has
+  // a stable point to sit on instead of alternating between growing and cutting workload.
+  if (smoothedFrameMs <= period * 1.05) return period;
+  return Math.min(period * 2, DISPLAY_REFRESH_MAX_MS);
+}
+
 // Whether the skew-T graph must recompute its analysis (and re-read the column snapshot it
 // belongs to) this frame. Pure function: keep the refresh policy in one place and testable.
 function shouldRefreshSoundingAnalysis(cachedAnalysis, analysisKey, nowMs, lightSkewT)
@@ -2026,6 +2076,7 @@ function frameProfilerBeginFrame()
     const interval = now - frameProfiler.frameStartMs;
     frameProfiler.intervalMs += interval;
     if (interval > frameProfiler.intervalMsMax) frameProfiler.intervalMsMax = interval;
+    noteFrameIntervalForPacing(interval);
   }
   frameProfiler.frameStartMs = now;
   frameProfiler.frames++;
@@ -2157,6 +2208,8 @@ function frameProfilerReportIfDue()
       }
       fetch('/api/frame-profile', { method : 'POST', headers : { 'Content-Type' : 'application/json' },
         body : JSON.stringify({ boot : frameProfiler.bootInfo || undefined,
+          refreshMs : displayRefreshPeriodMs,
+          tuneTargetMs : autoTuneTargetMs(frameProfiler.lastSummary.frameIntervalMs, displayRefreshPeriodMs),
           fps : frameProfiler.lastSummary.fps,
           intervalMs : frameProfiler.lastSummary.frameIntervalMs,
           intervalMaxMs : frameProfiler.lastSummary.frameIntervalMsMax,
@@ -31148,7 +31201,9 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     const leftLines = [
       '2D Weather Sandbox (F3 debug)',
       '',
-      fpsNow + ' fps  (' + frameMs.toFixed(1) + ' ms)  target ' + TARGET_FRAME_MS + ' ms',
+      fpsNow + ' fps  (' + frameMs.toFixed(1) + ' ms)  target '
+        + autoTuneTargetMs(frameMs, displayRefreshPeriodMs).toFixed(1) + ' ms  refresh '
+        + displayRefreshPeriodMs.toFixed(1) + ' ms',
       'Iters: ' + iters + '/frame  ' + itersPerSec + '/sec  auto=' + (guiControls.auto_IterPerFrame ? 'on' : 'off')
         + '  cap=' + maxAuto,
       'Sim rate: ~' + (fpsNow * iters * timePerIteration * 3600).toFixed(1) + 'x realtime',
@@ -35574,7 +35629,8 @@ drawNukeOverlay();
       const maxAutoIters = getMaxAutoIterPerFrame();
       if (guiControls.IterPerFrame > maxAutoIters)
         guiControls.IterPerFrame = maxAutoIters;
-      const msOverBudget = smoothedFrameMs - TARGET_FRAME_MS;
+      const tuneTargetMs = autoTuneTargetMs(smoothedFrameMs, displayRefreshPeriodMs);
+      const msOverBudget = smoothedFrameMs - tuneTargetMs;
       const warmingUp = getStartupIterationCap() != null;
       const gpuBehind = gpuFramesPending >= GPU_BACKLOG_GROWTH_BLOCK;
       if (gpuBacklogSkips > 0) {
