@@ -134,7 +134,42 @@ function serveFile(res, filePath) {
   });
 }
 
+// Frame-profile sink: the client posts its per-frame section timings here when it is
+// opened with ?prof=1, which prints them to this process' log so they can be inspected
+// remotely. No effect unless the client opts in. GET .../  returns the latest report.
+const frameProfiles = [];
+function profHandler(req, res) {
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(frameProfiles[frameProfiles.length - 1] || null));
+    return;
+  }
+  let body = '';
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 200000) req.destroy();
+  });
+  req.on('end', () => {
+    try {
+      const report = JSON.parse(body);
+      report.receivedAt = new Date().toISOString();
+      frameProfiles.push(report);
+      if (frameProfiles.length > 50) frameProfiles.shift();
+      console.log('[frame-profile] ' + JSON.stringify(report));
+    } catch (e) {
+      console.log('[frame-profile] bad payload: ' + e.message);
+    }
+    res.writeHead(204);
+    res.end();
+  });
+}
+
 function staticHandler(req, res) {
+  const pathname = (req.url || '').split('?')[0];
+  if (pathname === '/api/frame-profile' || pathname === '/api/frame-profile/') {
+    profHandler(req, res);
+    return;
+  }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { 'Content-Type': 'text/plain' });
     res.end('Method not allowed');

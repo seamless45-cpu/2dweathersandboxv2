@@ -1961,6 +1961,161 @@ function shouldRefreshSoundingAnalysis(cachedAnalysis, analysisKey, nowMs, light
 // background overlay scan uses it to stay out of the way when frames are heavy).
 var lastFrameTimeMsForScheduling = 16;
 
+// ---------------------------------------------------------------------------
+// Frame profiler
+// ---------------------------------------------------------------------------
+// Records where each frame's time goes: the coarse phases of draw() plus any function
+// wrapped with frameProfilerWrap(), and the wall-clock interval between frames (which
+// shows the part of the frame that is *not* JavaScript, i.e. GPU/compositor time).
+// Aggregated over a ~2 s window and shown in the F3 overlay. Opening the page with
+// ?prof=1 additionally posts the aggregate to /api/frame-profile so the server log can
+// be inspected remotely. Costs ~30 performance.now() calls per frame.
+var frameProfiler = {
+  sections : new Map(),     // name -> { ms, calls }
+  frames : 0,
+  windowStartMs : 0,
+  lastSummary : null,
+  lastPostMs : 0,
+  frameStartMs : 0,
+  intervalMs : 0,
+  intervalMsMax : 0,
+  post : false,
+  postChecked : false,
+  wrapping : false,
+};
+
+function frameProfilerRecord(name, ms)
+{
+  if (!(ms >= 0)) return;
+  let entry = frameProfiler.sections.get(name);
+  if (!entry) {
+    entry = { ms : 0, calls : 0 };
+    frameProfiler.sections.set(name, entry);
+  }
+  entry.ms += ms;
+  entry.calls++;
+}
+
+// The page posts its frame profile to the dev server when opened with ?prof=1, or when it
+// is being served from a local/preview host (where the log is the only way to see it
+// without a debugger attached). ?prof=0 opts out everywhere. Production hosts never post.
+function frameProfilerWantsPost(search, hostname)
+{
+  const query = String(search || '');
+  if (/[?&]prof=0(?:&|$)/.test(query)) return false;
+  if (/[?&]prof(?:=|&|$)/.test(query)) return true;
+  const host = String(hostname || '');
+  return host === 'localhost' || host === '127.0.0.1' || /\.e2b\.app$/.test(host);
+}
+
+function frameProfilerBeginFrame()
+{
+  const now = performance.now();
+  if (frameProfiler.frameStartMs > 0) {
+    const interval = now - frameProfiler.frameStartMs;
+    frameProfiler.intervalMs += interval;
+    if (interval > frameProfiler.intervalMsMax) frameProfiler.intervalMsMax = interval;
+  }
+  frameProfiler.frameStartMs = now;
+  frameProfiler.frames++;
+  if (frameProfiler.windowStartMs === 0)
+    frameProfiler.windowStartMs = now;
+}
+
+// Wraps a global function or an object method so its total time shows up in the profile.
+function frameProfilerWrap(target, name)
+{
+  const holder = target && typeof target === 'object' ? target : null;
+  const key = holder ? name : name;
+  const obj = holder || (typeof globalThis !== 'undefined' ? globalThis : window);
+  const orig = obj[key];
+  if (typeof orig !== 'function' || orig.__frameProfiled) return false;
+  const wrapped = function(...args) {
+    const t0 = performance.now();
+    try { return orig.apply(this, args); }
+    finally { frameProfilerRecord('fn:' + key, performance.now() - t0); }
+  };
+  wrapped.__frameProfiled = true;
+  obj[key] = wrapped;
+  return true;
+}
+
+var FRAME_PROFILE_WRAPPED = false;
+function frameProfilerWrapAll()
+{
+  if (FRAME_PROFILE_WRAPPED) return;
+  FRAME_PROFILE_WRAPPED = true;
+  const globalNames = [
+    'tickOverlayScan', 'beginStationSampleBatch', 'pollStationSampleBatch',
+    'runPressureRowMeanPass', 'updateColdPoolDomainMeanFromPending', 'refineInitiationWithConvergence',
+    'updateStormTracksFromPending', 'updateOutflowFrontsFromPending', 'updateWeatherLabelsFromPending',
+    'updateTornadoDetectionFromScan', 'updateEasFromPending', 'updateDropletSizeTexture',
+    'applyUserBrushPass', 'applyBrushInputToGpu', 'drawDebugOverlay', 'readDropletData',
+    'pushGpuFrameFence', 'pollGpuFrameFences', 'updateCinematicCamera', 'refreshLightningFieldCache',
+    'updateProceduralLightningState', 'rebuildTerrainHeightFromWalls', 'updateSunlight',
+    'updateOverlayTexturesFromData', 'runSilentTornadoScan',
+  ];
+  for (const name of globalNames)
+    frameProfilerWrap(null, name);
+  try { frameProfilerWrap(soundingGraph, 'draw'); } catch (e) { /* not ready yet */ }
+  try { frameProfilerWrap(window.AviationTraffic, 'updateOverlays'); } catch (e) { /* optional */ }
+  if (window.WeatherSandbox && window.WeatherSandbox.synopticBoundaries)
+    frameProfilerWrap(window.WeatherSandbox.synopticBoundaries, 'updateMarkers');
+  if (window.WeatherSandbox && window.WeatherSandbox.eas)
+    frameProfilerWrap(window.WeatherSandbox.eas, 'tick');
+}
+
+// One F3 line with the top frame costs over the last reporting window.
+function frameProfilerSummaryLines()
+{
+  const s = frameProfiler.lastSummary;
+  if (!s)
+    return 'warming up (' + frameProfiler.frames + ' frames in window)';
+  const top = s.rows.slice(0, 4).map(r => r.name.replace(/^(phase-|fn:)/, '').replace('phase-', '')
+    + ' ' + r.msPerFrame.toFixed(1)).join('  ');
+  return 'interval ' + s.frameIntervalMs.toFixed(1) + ' ms (max ' + s.frameIntervalMsMax.toFixed(0) + ')  '
+    + 'js ' + s.jsMsPerFrame.toFixed(1) + ' ms  |  ' + top;
+}
+
+function frameProfilerReportIfDue()
+{
+  const now = performance.now();
+  if (frameProfiler.windowStartMs === 0 || frameProfiler.frames < 1)
+    return;
+  if (now - frameProfiler.windowStartMs < 2000)
+    return;
+  const frames = frameProfiler.frames;
+  const rows = [];
+  for (const [ name, entry ] of frameProfiler.sections)
+    rows.push({ name : name, msPerFrame : entry.ms / frames, callsPerFrame : entry.calls / frames });
+  rows.sort((a, b) => b.msPerFrame - a.msPerFrame);
+  const jsMs = rows.filter(r => r.name !== 'frame-interval').reduce((a, r) => a + r.msPerFrame, 0);
+  frameProfiler.lastSummary = {
+    fps : 1000 / Math.max(1, frameProfiler.intervalMs / frames),
+    frameIntervalMs : frameProfiler.intervalMs / frames,
+    frameIntervalMsMax : frameProfiler.intervalMsMax,
+    jsMsPerFrame : jsMs,
+    rows : rows,
+  };
+  if (frameProfiler.post) {
+    try {
+      fetch('/api/frame-profile', { method : 'POST', headers : { 'Content-Type' : 'application/json' },
+        body : JSON.stringify({ fps : frameProfiler.lastSummary.fps,
+          intervalMs : frameProfiler.lastSummary.frameIntervalMs,
+          intervalMaxMs : frameProfiler.lastSummary.frameIntervalMsMax,
+          jsMs : jsMs, iters : (typeof guiControls !== 'undefined' && guiControls.IterPerFrame) | 0,
+          grid : (typeof sim_res_x !== 'undefined' ? sim_res_x + 'x' + sim_res_y : '?'),
+          rows : rows.slice(0, 14).map(r => [ r.name, Math.round(r.msPerFrame * 100) / 100,
+            Math.round(r.callsPerFrame * 10) / 10 ]) }) });
+    } catch (e) { /* never let profiling break the frame */ }
+  }
+  frameProfiler.sections.clear();
+  frameProfiler.frames = 0;
+  frameProfiler.intervalMs = 0;
+  frameProfiler.intervalMsMax = 0;
+  frameProfiler.windowStartMs = now;
+}
+
 var NUM_DROPLETS;
 const NUM_DROPLETS_DEVIDER = 25; // baseline cells-per-droplet at default res
 const NUM_DROPLETS_CAP = 80000; // hard GPU TF cap (was 120000)
@@ -30968,6 +31123,8 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       'Paused: ' + (guiControls.paused ? 'yes' : 'no')
         + '  precip=' + (guiControls.enablePrecipitation ? 'on' : 'off')
         + '  bloom=' + (guiControls.enableBloom ? 'on' : 'off'),
+      'Frame profile' + (frameProfiler.post ? ' (posting to server)' : '') + ': '
+        + frameProfilerSummaryLines(),
       'Snd scan: ' + (overlayScan.active
           ? Math.min(sim_res_x, overlayScan.nextIndex * overlayScan.step) + '/' + sim_res_x + ' px'
           : 'idle')
@@ -33080,6 +33237,14 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   function draw()
   { // Runs for every frame
     const frameDrawStart = performance.now();
+    frameProfilerBeginFrame();
+    frameProfilerWrapAll();
+    if (!frameProfiler.postChecked && typeof location !== 'undefined') {
+      frameProfiler.postChecked = true;
+      if (frameProfilerWantsPost(location.search, location.hostname))
+        frameProfiler.post = true;
+    }
+    let fpPhaseT = frameDrawStart;
     var inputType = -1;
     let camPanSpeed = guiControls.camSpeed;
 
@@ -33137,15 +33302,20 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     mouseYinSim = screenToSimY(mouseY);
 
     if (shouldSkipIdlePausedFrame(frameDrawStart)) {
+      frameProfilerRecord('phase-skip-idle', performance.now() - fpPhaseT);
       requestAnimationFrame(draw);
       return;
     }
 
     if (pollGpuFrameFences() >= GPU_BACKLOG_SKIP_FRAMES) {
       gpuBacklogSkips++;
+      frameProfilerRecord('phase-skip-gpu-backlog', performance.now() - fpPhaseT);
       requestAnimationFrame(draw);
       return;
     }
+
+    frameProfilerRecord('phase-input', performance.now() - fpPhaseT);
+    fpPhaseT = performance.now();
 
     if (SETUP_MODE) {
       const setupHeavy = getSimCellCount() >= 700000;
@@ -33169,6 +33339,8 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       // pockets under H(x) and can crash the solver as soon as you paint.
       rasterizeTerrainFromHeight(-1, 0, null, { allowCaves: false });
       }
+      frameProfilerRecord('phase-setup', performance.now() - fpPhaseT);
+      fpPhaseT = performance.now();
     } else {
       // NOT SETUP MODE:
 
@@ -33302,6 +33474,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       if (!guiControls.paused && !isMultiplayerPeer()
           && !(window.WeatherSandbox && window.WeatherSandbox.replay
               && window.WeatherSandbox.replay.isPhysicsBlocked())) { // Simulation part
+        fpPhaseT = performance.now();
 
         let balloonSimIters = 0;
         let particleLightningCheckPending = false;
@@ -33775,6 +33948,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
 
         runPressureRowMeanPass(pressureRowMeanProgram, baseTexture_0, waterTexture_0, wallTexture_0);
 
+      frameProfilerRecord('phase-simulate', performance.now() - fpPhaseT);
       } // end of simulation part
       else if (guiControls.paused && !isMultiplayerPeer() && leftMousePressed &&
                (inputType > 0 || isPaintingCustomBrushTool())
@@ -33873,6 +34047,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     tempChangeHistorySeeded = viewingTempChange;
 
     // render to canvas
+    fpPhaseT = performance.now();
     gl.useProgram(realisticDisplayProgram);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null); // null is canvas
     gl.viewport(0, 0, canvas.width, canvas.height);
@@ -34918,6 +35093,8 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
         }
       }
 
+    frameProfilerRecord('phase-display-gl', performance.now() - fpPhaseT);
+    fpPhaseT = performance.now();
   } // end of display mode else block
 
   // Always hide risk canvas when not in DISP_RISK
@@ -35321,6 +35498,8 @@ drawNukeOverlay();
       }
     }
 
+    frameProfilerRecord('phase-hud-2d', performance.now() - fpPhaseT);
+    fpPhaseT = performance.now();
     updateFrameTimeStats(performance.now() - frameDrawStart);
 
     // Auto-adjust iterations per frame every frame using smoothedFrameMs instead of
@@ -35368,6 +35547,8 @@ drawNukeOverlay();
       rp.tickPlayback(smoothedFrameMs || 16);
     }
 
+    frameProfilerRecord('phase-tail', performance.now() - fpPhaseT);
+    frameProfilerReportIfDue();
     gpuBacklogSkips = 0;
     pushGpuFrameFence();
     frameNum++;
