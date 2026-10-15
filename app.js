@@ -905,12 +905,26 @@ function beginAsyncReadPixels(reader, x, y, w, h, format, type, byteSize, meta)
   return true;
 }
 
+// A pack buffer that was written and fenced must be read back before it is written again;
+// otherwise Chrome drops the shadow copy that makes getBufferSubData cheap, and the next
+// readback of that buffer turns into a synchronous GPU round trip (the "READ-usage buffer
+// was written, then fenced, but written again before being read back" warning and
+// multi-millisecond getBufferSubData stalls). Abandoned buffers are therefore replaced.
+function discardAsyncReaderBuffer(reader)
+{
+  if (reader.pbo)
+    gl.deleteBuffer(reader.pbo);
+  reader.pbo = null;
+  reader.byteSize = 0;
+}
+
 function cancelAsyncReadPixels(reader)
 {
   if (reader && reader.sync) {
     gl.deleteSync(reader.sync);
     reader.sync = null;
     reader.meta = null;
+    discardAsyncReaderBuffer(reader);
   }
 }
 
@@ -924,8 +938,10 @@ function pollAsyncReadPixels(reader, dst)
     return false;
   gl.deleteSync(reader.sync);
   reader.sync = null;
-  if (dst.byteLength !== reader.byteSize)
+  if (dst.byteLength !== reader.byteSize) {
+    discardAsyncReaderBuffer(reader);
     return false;
+  }
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, reader.pbo);
   gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dst);
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
@@ -6144,6 +6160,26 @@ class FBO // wraps texture, frambuffer and info in one
     this.texelSizeX = 1.0 / this.width;
     this.texelSizeY = 1.0 / this.height;
   }
+
+  // Release the GL objects. Render targets are recreated on resize / pixel-ratio / HDR scale
+  // changes; without this every recreation leaked a full chain of RGBA16F textures.
+  dispose()
+  {
+    if (this.frameBuffer)
+      gl.deleteFramebuffer(this.frameBuffer);
+    if (this.texture)
+      gl.deleteTexture(this.texture);
+    this.frameBuffer = null;
+    this.texture = null;
+  }
+}
+
+function disposeFBOList(list)
+{
+  for (const fbo of list)
+    if (fbo && fbo.dispose)
+      fbo.dispose();
+  list.length = 0;
 }
 
 function getHdrRenderDimensions()
@@ -6157,6 +6193,8 @@ function getHdrRenderDimensions()
 function createHdrFBO()
 {
   const dim = getHdrRenderDimensions();
+  if (hdrFBO && hdrFBO.dispose)
+    hdrFBO.dispose();
   hdrFBO = new FBO(dim.w, dim.h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
 }
 
@@ -6165,7 +6203,7 @@ function createBloomFBOs()
   const dim = getHdrRenderDimensions();
   let res = new Vec2D(dim.w, dim.h);
 
-  bloomFBOs.length = 0;           // empty array
+  disposeFBOList(bloomFBOs);
   for (let i = 0; i < 100; i++) { // max bloom iterations
     let width = res.x >> i;       // right shift to devide by 2 multiple times
     let height = res.y >> i;
@@ -6183,13 +6221,15 @@ function createBloomFBOs()
 
 function createAmbientLightFBOs()
 {
+  if (emittedLightFBO && emittedLightFBO.dispose)
+    emittedLightFBO.dispose();
   emittedLightFBO = new FBO(sim_res_x, sim_res_y, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
 
   let res = new Vec2D(sim_res_x, sim_res_y);
 
   // debugLog('createAmbientLightFBOs');
 
-  ambientLightFBOs.length = 0;   // empty array
+  disposeFBOList(ambientLightFBOs);
   // Ultra-wide (e.g. 16000×200): skip the full-res bounce mip — lighting physics
   // still uses emittedLightFBO at sim resolution.
   const startI = isUltraHighResSim() ? 1 : 0;
@@ -14367,10 +14407,13 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
     gl.uniform1f(gl.getUniformLocation(lightingProgram, 'greenhouseGases'), guiControls.greenhouseGases);
     gl.uniform1f(gl.getUniformLocation(lightingProgram, 'waterGreenHouseEffect'), guiControls.waterGreenHouseEffect);
     gl.uniform1f(gl.getUniformLocation(lightingProgram, 'IR_rate'), guiControls.IR_rate);
+    // boundaryProgram has to be bound for its uniform (was set while advectionProgram was
+    // bound → INVALID_OPERATION and a stale ice melt rate in the boundary pass).
+    gl.useProgram(boundaryProgram);
+    gl.uniform1f(gl.getUniformLocation(boundaryProgram, 'meltingHeat'), guiControls.meltingHeat);
     gl.useProgram(advectionProgram);
     gl.uniform1f(gl.getUniformLocation(advectionProgram, 'evapHeat'), guiControls.evapHeat);
     gl.uniform1f(gl.getUniformLocation(advectionProgram, 'meltingHeat'), guiControls.meltingHeat);
-    gl.uniform1f(gl.getUniformLocation(boundaryProgram, 'meltingHeat'), guiControls.meltingHeat);
     gl.uniform1f(gl.getUniformLocation(advectionProgram, 'condensationRate'), guiControls.condensationRate);
     gl.uniform1f(gl.getUniformLocation(advectionProgram, 'cloudEvaporationRate'),
       guiControls.cloudEvaporationRate != null ? guiControls.cloudEvaporationRate : 0.08);
@@ -15032,6 +15075,7 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
       .onChange(function() {
         gl.useProgram(advectionProgram);
         gl.uniform1f(gl.getUniformLocation(advectionProgram, 'meltingHeat'), guiControls.meltingHeat);
+        gl.useProgram(boundaryProgram);
         gl.uniform1f(gl.getUniformLocation(boundaryProgram, 'meltingHeat'), guiControls.meltingHeat);
         gl.useProgram(precipitationProgram);
         gl.uniform1f(gl.getUniformLocation(precipitationProgram, 'meltingHeat'), guiControls.meltingHeat);
@@ -16077,6 +16121,7 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
     document.body.appendChild(clockEl);
 
     smoothedFrameMs = 18;
+    perfFrameMs = 18;
 
     clockEl.innerHTML = '';
     clockEl.style.position = 'fixed';
@@ -22575,6 +22620,12 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   var lastBpressTime;
 
   var smoothedFrameMs = 18;
+  // Frame time fed to the adaptive quality / iteration controllers. It is held while a
+  // lightning flash is on screen: a flash only lasts a fraction of a second, and letting it
+  // drive the controllers made every strike drop resolution, bloom levels and iterations
+  // (then reallocate render targets and slowly climb back) — a visible hitch per flash.
+  var perfFrameMs = 18;
+  var lastParticleFlashPerfMs = -1e9;
   var realisticVisualQuality = 1.0;
   var sunlightVisualQuality = 1.0;
   var smoothedRealisticVisualQuality = 1.0;
@@ -22600,7 +22651,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     // from cell count, or a 12000×200 grid stays in lite-mode on a fast GPU.
     if (guiControls.performanceAutoScaling === false)
       return 0;
-    let p = clamp((smoothedFrameMs - TARGET_FRAME_MS) / 36.0, 0, 1);
+    let p = clamp((perfFrameMs - TARGET_FRAME_MS) / 36.0, 0, 1);
     if (p > 0.05) {
       const resBias = clamp((getResolutionCostFactor() - 1.0) * 0.10, 0, 0.22);
       p = clamp(p + resBias, 0, 1);
@@ -22659,18 +22710,27 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     return scale;
   }
 
+  // Each rescale reallocates the HDR + bloom chain (a hitch on its own), so it must not
+  // oscillate: never during a lightning flash, at most every few seconds, and only scale
+  // back up once pressure is clearly gone (hysteresis vs the 0.22 downscale threshold).
+  var hdrRescaleLastMs = -1e9;
   function updateHdrRenderScaleIfNeeded()
   {
     const target = getTargetHdrRenderScale();
-    if (target < hdrRenderScaleState - 0.01) {
-      hdrRenderScaleState = target;
-      createBloomFBOs();
-      createHdrFBO();
-    } else if (target > hdrRenderScaleState + 0.124 && getSmoothedFramePressure() < 0.22) {
-      hdrRenderScaleState = target;
-      createBloomFBOs();
-      createHdrFBO();
-    }
+    if (Math.abs(target - hdrRenderScaleState) < 0.01)
+      return;
+    const now = performance.now();
+    const manual = guiControls.performanceAutoScaling === false;
+    if (!manual && (isLightningFlashPerfHold() || now - hdrRescaleLastMs < 4000))
+      return;
+    const down = target < hdrRenderScaleState;
+    if (!manual && !down && (target < hdrRenderScaleState + 0.124 || getSmoothedFramePressure() >= 0.12
+        || now - hdrRescaleLastMs < 8000))
+      return;
+    hdrRenderScaleState = target;
+    hdrRescaleLastMs = now;
+    createBloomFBOs();
+    createHdrFBO();
   }
 
   function needsAmbientLightBlur()
@@ -22736,10 +22796,10 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     return !!guiControls.radarOverlay;
   }
 
+  // Advanced once per frame in updateFrameTimeStats(). It used to step on every call, so
+  // its speed depended on how many systems happened to query it in a frame.
   function getSmoothedFramePressure()
   {
-    const p = getFramePressure();
-    smoothedAmbientPressure = smoothedAmbientPressure * 0.92 + p * 0.08;
     return smoothedAmbientPressure;
   }
 
@@ -22823,11 +22883,22 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     return Math.min(bloomFBOs.length, cap);
   }
 
+  function isLightningFlashPerfHold()
+  {
+    const st = proceduralLightningState;
+    if (st && st.eventAge >= 0 && st.eventAge < getLightningFlashDuration())
+      return true;
+    return performance.now() - lastParticleFlashPerfMs < 1200;
+  }
+
   function updateFrameTimeStats(frameMs)
   {
     // Faster EMA (0.80 vs old 0.88) so the auto-iter controller reacts in ~5 frames instead of ~8
     smoothedFrameMs = smoothedFrameMs * 0.80 + frameMs * 0.20;
     lastFrameTimeMsForScheduling = smoothedFrameMs;
+    if (!isLightningFlashPerfHold())
+      perfFrameMs = perfFrameMs * 0.80 + frameMs * 0.20;
+    smoothedAmbientPressure = smoothedAmbientPressure * 0.85 + getFramePressure() * 0.15;
     beginGlStateFrameStats();
   }
 
@@ -29785,68 +29856,84 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     });
   }
 
+  // CG-strike fire ignition. The ground cell under the strike used to be located with up to
+  // ~30 blocking 1x1 readPixels (each a full GPU sync) on the frame of the strike. The wall
+  // column around the contact point is now read asynchronously and the fire tile is written
+  // once the read lands, a frame or two later.
+  const LT_FIRE_SCAN_UP = 18;   // rows searched from the hint upward (first preference)
+  const LT_FIRE_SCAN_DOWN = 12; // rows searched below the hint
+  const ltFireReader = createAsyncPixelReader();
+  let ltFireColumn = null;      // Int8Array RGBA_INTEGER strip, sized per request
+  let ltFireRequest = null;     // { x, y0, yStart, rows, frames }
   const _ltFireWallScratch = new Int8Array(4);
-  const _ltFireWaterSurfScratch = new Float32Array(4);
-  const _ltFireWaterAboveScratch = new Float32Array(4);
 
-  function findSurfaceWallAtSimColumn(simX, hintY)
+  function requestLightningFireIgnition(simX, hintY)
   {
+    if (ltFireRequest || asyncPixelReaderBusy(ltFireReader))
+      return; // one ignition in flight at a time; extra strikes in the same frames are rare
     const px = Math.max(0, Math.min(sim_res_x - 1, Math.floor(simX)));
     const y0 = Math.max(0, Math.min(sim_res_y - 1, Math.floor(hintY)));
+    const yStart = Math.max(0, y0 - LT_FIRE_SCAN_DOWN);
+    const yEnd = Math.min(sim_res_y, y0 + LT_FIRE_SCAN_UP);
+    const rows = yEnd - yStart;
+    if (rows <= 0)
+      return;
+    if (!ltFireColumn || ltFireColumn.length !== rows * 4)
+      ltFireColumn = new Int8Array(rows * 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_1);
     gl.readBuffer(gl.COLOR_ATTACHMENT2);
-    const wallPix = _ltFireWallScratch;
-    for (let y = y0; y < Math.min(y0 + 18, sim_res_y); y++) {
-      gl.readPixels(px, y, 1, 1, gl.RGBA_INTEGER, gl.BYTE, wallPix);
-      if (wallPix[1] === 0) {
-        gl.readBuffer(gl.COLOR_ATTACHMENT0);
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        return { x: px, y, type: wallPix[0], veg: wallPix[3] };
-      }
-    }
-    for (let y = y0 - 1; y >= Math.max(0, y0 - 12); y--) {
-      gl.readPixels(px, y, 1, 1, gl.RGBA_INTEGER, gl.BYTE, wallPix);
-      if (wallPix[1] === 0) {
-        gl.readBuffer(gl.COLOR_ATTACHMENT0);
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        return { x: px, y, type: wallPix[0], veg: wallPix[3] };
-      }
-    }
+    beginAsyncReadPixels(ltFireReader, px, yStart, 1, rows, gl.RGBA_INTEGER, gl.BYTE, rows * 4, null);
     gl.readBuffer(gl.COLOR_ATTACHMENT0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return null;
+    ltFireRequest = { x: px, y0, yStart, rows, frames: 0, simW: sim_res_x, simH: sim_res_y };
   }
 
-  function readSurfaceFireConditions(px, py)
+  function pollLightningFireIgnition()
   {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_1);
-    gl.readBuffer(gl.COLOR_ATTACHMENT1);
-    gl.readPixels(px, py, 1, 1, gl.RGBA, gl.FLOAT, _ltFireWaterSurfScratch);
-    const aboveY = Math.min(py + 1, sim_res_y - 1);
-    gl.readPixels(px, aboveY, 1, 1, gl.RGBA, gl.FLOAT, _ltFireWaterAboveScratch);
-    gl.readBuffer(gl.COLOR_ATTACHMENT0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return {
-      soilMoist: _ltFireWaterSurfScratch[2],
-      precip: _ltFireWaterAboveScratch[2],
-    };
-  }
-
-  function setSurfaceWallType(px, py, wallType)
-  {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuff_1);
-    gl.readBuffer(gl.COLOR_ATTACHMENT2);
-    gl.readPixels(px, py, 1, 1, gl.RGBA_INTEGER, gl.BYTE, _ltFireWallScratch);
-    gl.readBuffer(gl.COLOR_ATTACHMENT0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    if (_ltFireWallScratch[1] !== 0)
-      return false;
-    _ltFireWallScratch[0] = wallType;
+    const req = ltFireRequest;
+    if (!req)
+      return;
+    if (req.simW !== sim_res_x || req.simH !== sim_res_y) { // grid changed: drop it
+      cancelAsyncReadPixels(ltFireReader);
+      ltFireRequest = null;
+      return;
+    }
+    if (!pollAsyncReadPixels(ltFireReader, ltFireColumn)) {
+      if (!asyncPixelReaderBusy(ltFireReader) || ++req.frames > 120) {
+        cancelAsyncReadPixels(ltFireReader);
+        ltFireRequest = null;
+      }
+      return;
+    }
+    ltFireRequest = null;
+    const col = ltFireColumn;
+    const rowOf = (y) => (y - req.yStart) * 4;
+    // Same search order as before: first solid cell from the hint upward, then downward.
+    let hitY = -1;
+    for (let y = req.y0; y < req.yStart + req.rows; y++) {
+      if (col[rowOf(y) + 1] === 0) { hitY = y; break; }
+    }
+    if (hitY < 0) {
+      for (let y = req.y0 - 1; y >= req.yStart; y--) {
+        if (col[rowOf(y) + 1] === 0) { hitY = y; break; }
+      }
+    }
+    if (hitY < 0)
+      return;
+    const o = rowOf(hitY);
+    const t = col[o];
+    // Ignite solid ground/structures at the strike column (not water/ice/open air).
+    if (t === 2 || t === 3 || t === 8 || t === 9 || t === 0 || t === 27)
+      return;
+    // FOREST2 (26) -> FIRE_FOREST2 (27); everything else -> FIRE (3)
+    _ltFireWallScratch[0] = t === 26 ? 27 : 3;
+    _ltFireWallScratch[1] = col[o + 1];
+    _ltFireWallScratch[2] = col[o + 2];
+    _ltFireWallScratch[3] = col[o + 3];
     for (const tex of [wallTexture_0, wallTexture_1]) {
       gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, px, py, 1, 1, gl.RGBA_INTEGER, gl.BYTE, _ltFireWallScratch);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, req.x, hitY, 1, 1, gl.RGBA_INTEGER, gl.BYTE, _ltFireWallScratch);
     }
-    return true;
   }
 
   function tryIgniteFireFromCgStrike(strike)
@@ -29858,17 +29945,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     // 50/50 chance to spawn a fire tile at the ground-contact cell.
     if (!LightningV2.rollCgLightningFireChance(strike.ltType, 1, strike.seed, guiControls))
       return;
-    const strikeX = strike.destX;
-    const strikeY = strike.destY;
-    const surface = findSurfaceWallAtSimColumn(strikeX, strikeY);
-    if (!surface)
-      return;
-    // Ignite solid ground/structures at the strike column (not water/ice/open air).
-    const t = surface.type;
-    if (t === 2 || t === 3 || t === 8 || t === 9 || t === 0 || t === 27)
-      return;
-    // FOREST2 (26) → FIRE_FOREST2 (27); everything else → FIRE (3)
-    setSurfaceWallType(surface.x, surface.y, t === 26 ? 27 : 3);
+    requestLightningFireIgnition(strike.destX, strike.destY);
   }
 
   const chargeDischargeUniformData = new Float32Array(16);
@@ -31145,6 +31222,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       return;
     if (readIterNum - startIter > 12)
       return;
+    lastParticleFlashPerfMs = performance.now();
     const eventKey = 'particle-' + startIter;
     if (guiControls.radarLightningIcons)
       registerRadarLightningStrike(eventKey, clamp(data[0] * sim_res_x, 0, sim_res_x - 1),
@@ -33778,7 +33856,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
             const runChargePass = chargeToolPainting
               || (isLightningCpuReady() && !guiControls.skipChargeCalculation);
             let chargeStride = 1;
-            if (guiControls.adaptiveLightningQuality !== false && smoothedFrameMs > TARGET_FRAME_MS * 1.12)
+            if (guiControls.adaptiveLightningQuality !== false && perfFrameMs > TARGET_FRAME_MS * 1.12)
               chargeStride = 2;
             if (getFramePressure() > 0.45)
               chargeStride = Math.max(chargeStride, 3);
@@ -34108,6 +34186,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
           iterNum++;
         }
 
+        pollLightningFireIgnition();
         if (particleLightningCheckPending)
           detectParticleLightningStrike();
 
@@ -35709,8 +35788,9 @@ drawNukeOverlay();
       const maxAutoIters = getMaxAutoIterPerFrame();
       if (guiControls.IterPerFrame > maxAutoIters)
         guiControls.IterPerFrame = maxAutoIters;
-      const tuneTargetMs = autoTuneTargetMs(smoothedFrameMs, displayRefreshPeriodMs);
-      const msOverBudget = smoothedFrameMs - tuneTargetMs;
+      // perfFrameMs ignores lightning-flash frames, so a strike no longer cuts iterations.
+      const tuneTargetMs = autoTuneTargetMs(perfFrameMs, displayRefreshPeriodMs);
+      const msOverBudget = perfFrameMs - tuneTargetMs;
       const warmingUp = getStartupIterationCap() != null;
       const gpuBehind = gpuFramesPending >= GPU_BACKLOG_GROWTH_BLOCK;
       if (gpuBacklogSkips > 0) {

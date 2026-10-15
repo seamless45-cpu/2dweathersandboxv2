@@ -59,6 +59,7 @@ const FUNCTIONS = [
   'createAsyncPixelReader',
   'asyncPixelReaderBusy',
   'beginAsyncReadPixels',
+  'discardAsyncReaderBuffer',
   'cancelAsyncReadPixels',
   'pollAsyncReadPixels',
 ];
@@ -132,6 +133,7 @@ function makeFakeGl(simResX, simResY)
     bindFramebuffer : (target, fbo) => { state.boundFramebuffer = fbo; },
     readBuffer : (attachment) => { state.readBuffer = attachment; },
     createBuffer : () => nextBuffer++,
+    deleteBuffer: (buffer) => { state.pbos.delete(buffer); },
     bindBuffer : (target, buffer) => { state.boundPbo = target === GL.PIXEL_PACK_BUFFER ? buffer : null; },
     bufferData : (target, byteSize) => { state.pbos.set(state.boundPbo, new Uint8Array(byteSize)); },
     readPixels : (x, y, w, h, format, type, dst) => {
