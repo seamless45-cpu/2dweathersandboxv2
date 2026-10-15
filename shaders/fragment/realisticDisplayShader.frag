@@ -26,7 +26,7 @@ uniform sampler2D lightningTex;
 uniform sampler2D lightningDataTex;
 
 uniform sampler2D ambientLightTex;
-uniform sampler2D lightningOnLightTex;
+uniform highp sampler2D ltBoltPathTex; // prebuilt SDF bolt polylines (lightningBoltPathShader)
 uniform sampler2D lightningCloudFlashTex;
 uniform sampler2D lightningSurfFlashTex;
 uniform sampler2D sunColumnTex;
@@ -499,13 +499,50 @@ float segGlow(float d, float coreR) {
        + exp(-d / (coreR * 6.0)) * 0.04;
 }
 
+// Enhanced SDF bolts. The polylines are built ONCE per frame by lightningBoltPathShader.frag
+// into ltBoltPathTex (layout documented there); this shader only measures the distance from
+// the pixel to them. Rebuilding the random-walk geometry (plus two 80-step terrain walks)
+// in every pixel near the strike was the main cause of the lightning frame-time spike.
+#define LT_PATH_HDR_COL 62
+#define LT_PATH_BOX_COL 63
+
+// Glow of one prebuilt polyline at p, with the same min-distance / fade / early-out rules as
+// the old per-pixel builder. tailFade dims the far end (CG side branches use 0.55).
+float ltPathRowGlow(vec2 p, int row, float spiderProg, float coreR, float tailFade)
+{
+  vec4 hdr = texelFetch(ltBoltPathTex, ivec2(LT_PATH_HDR_COL, row), 0);
+  if (hdr.y < 0.5)
+    return 0.0;
+  int segs = int(hdr.x + 0.5);
+  if (segs < 1)
+    return 0.0;
+  // Skip polylines whose bounding box is beyond the visible glow radius: segGlow's widest
+  // term is exp(-d / (6 coreR)) * 0.04, which is < 4e-8 past 84 coreR.
+  vec4 box = texelFetch(ltBoltPathTex, ivec2(LT_PATH_BOX_COL, row), 0);
+  vec2 outside = max(max(box.xy - p, p - box.zw), vec2(0.0));
+  if (dot(outside, outside) > (coreR * 84.0) * (coreR * 84.0))
+    return 0.0;
+
+  float minD = 1e10, minFade = 0.0;
+  vec2 a = texelFetch(ltBoltPathTex, ivec2(0, row), 0).xy;
+  for (int i = 0; i < 48; i++) {
+    if (i >= segs) break;
+    vec2 b = texelFetch(ltBoltPathTex, ivec2(i + 1, row), 0).xy;
+    float t0   = float(i) / float(segs);
+    float fade = clamp((spiderProg - t0) * float(segs), 0.0, 1.0);
+    float d    = spiderSegSDF(p, a, b);
+    if (d < minD) { minD = d; minFade = fade * (1.0 - t0 * tailFade); }
+    if (minD < coreR * 0.5) break;
+    a = b;
+  }
+  return segGlow(minD, coreR) * minFade;
+}
+
 // lodReduced: 0 = full Enhanced detail, 1 = coarsened (same seeds/angles, fewer segs).
 vec3 displaySpiderLightning(vec2 sampleUV, vec2 lightningPos, float T, float boltSeed, float lodReduced)
 {
   const float mainCoreR = 0.000375;
   const float subCoreR  = mainCoreR * 0.60;
-  const int   MSEGS_MAX = 40;
-  const int   SSEGS_MAX = 16;
 
   float spiderProg  = clamp(T, 0.0, 1.0);
   float flashBright = T < 1.0
@@ -514,106 +551,25 @@ vec3 displaySpiderLightning(vec2 sampleUV, vec2 lightningPos, float T, float bol
   // Look sliders applied after HDR tonemap in main (pre-tonemap multiply is crushed).
   if (flashBright < 0.0001) return vec3(0.0);
 
-  bool reduced = lodReduced > 0.5;
-  int msegs = reduced ? 20 : 40;
-  int ssegs = reduced ? 8 : 16;
-  int nBolts = reduced ? 2 : 3;
-  int nSubs = reduced ? 2 : 3;
-  // Keep similar spatial reach when segment count drops.
-  float spiderStep = 0.013 * (40.0 / float(msegs));
-
-  vec2 p      = vec2(sampleUV.x * aspectRatios[0], sampleUV.y);
-  vec2 origin = vec2(lightningPos.x * aspectRatios[0], lightningPos.y);
+  int base = 24 + (lodReduced > 0.5 ? 12 : 0);
+  vec2 p = vec2(sampleUV.x * aspectRatios[0], sampleUV.y);
 
   float totalGlow = 0.0;
-  vec2  mVerts[41];
-  vec2  sVerts[17];
-
-  for (int b = 0; b < 3; b++) {
-    if (b >= nBolts) break;
-    float bs = boltSeed + float(b) * 137.51;
-
-    float goRight   = random2d(vec2(bs * 0.00113, bs * 0.00173 + 1.7)) > 0.5 ? 1.0 : -1.0;
-    float mainAngle = goRight > 0.0 ? 0.0 : PI;
-    mainAngle += (random2d(vec2(bs * 0.00217, bs * 0.00319)) - 0.5) * 0.4;
-
-    float ang = mainAngle;
-    mVerts[0] = origin;
-
-    for (int i = 0; i < MSEGS_MAX; i++) {
-      if (i >= msegs) break;
-      float r1 = random2d(vec2(bs * 0.00371 + float(i) * 0.0937, bs * 0.00591 + float(i) * 0.0517));
-      ang += (r1 - 0.5) * 2.5;
-      ang -= (ang - mainAngle) * 0.12;
-      ang -= sin(ang) * 0.28;
-      mVerts[i + 1] = mVerts[i] + vec2(cos(ang), sin(ang)) * spiderStep;
-    }
-
-    vec2  tip        = mVerts[msegs];
-    vec2  tipTC      = vec2(tip.x / aspectRatios[0], clamp(tip.y, 0.0, 1.0));
-    float cloudAtTip = texture(waterTex, tipTC)[CLOUD];
-
-    if (cloudAtTip >= 0.008) {
-      float minD = 1e10, minFade = 0.0;
-      for (int i = 0; i < MSEGS_MAX; i++) {
-        if (i >= msegs) break;
-        float t0   = float(i) / float(msegs);
-        float fade = clamp((spiderProg - t0) * float(msegs), 0.0, 1.0);
-        float d    = spiderSegSDF(p, mVerts[i], mVerts[i + 1]);
-        if (d < minD) { minD = d; minFade = fade; }
-        if (minD < mainCoreR * 0.5) break;
-      }
-      totalGlow += segGlow(minD, mainCoreR) * minFade;
-
-      for (int s = 0; s < 3; s++) {
-        if (s >= nSubs) break;
-        float ss       = bs + float(s) * 73.37;
-        int   spawnIdx = min(int(random2d(vec2(ss * 0.00413, ss * 0.00237)) * float(msegs - 5)) + 2, msegs - 1);
-        float subAng   = mainAngle;
-        sVerts[0]      = mVerts[spawnIdx];
-
-        for (int i = 0; i < SSEGS_MAX; i++) {
-          if (i >= ssegs) break;
-          float r1 = random2d(vec2(ss * 0.00511 + float(i) * 0.0937, ss * 0.00391 + float(i) * 0.0711));
-          subAng += (r1 - 0.5) * 2.5;
-          subAng -= (subAng - mainAngle) * 0.12;
-          subAng -= sin(subAng) * 0.28;
-          sVerts[i + 1] = sVerts[i] + vec2(cos(subAng), sin(subAng)) * spiderStep;
-        }
-
-        vec2  sTip       = sVerts[ssegs];
-        vec2  sTipTC     = vec2(sTip.x / aspectRatios[0], clamp(sTip.y, 0.0, 1.0));
-        float cloudAtSub = texture(waterTex, sTipTC)[CLOUD];
-        if (cloudAtSub >= 0.008) {
-          float sMinD = 1e10, sMinFade = 0.0;
-          for (int i = 0; i < SSEGS_MAX; i++) {
-            if (i >= ssegs) break;
-            float t0   = float(i) / float(ssegs);
-            float fade = clamp((spiderProg - t0) * float(ssegs), 0.0, 1.0);
-            float d    = spiderSegSDF(p, sVerts[i], sVerts[i + 1]);
-            if (d < sMinD) { sMinD = d; sMinFade = fade; }
-            if (sMinD < subCoreR * 0.5) break;
-          }
-          totalGlow += segGlow(sMinD, subCoreR) * sMinFade * 0.44;
-        }
-      }
-    }
-  }
+  for (int b = 0; b < 3; b++)
+    totalGlow += ltPathRowGlow(p, base + b, spiderProg, mainCoreR, 0.0);
+  for (int s = 0; s < 9; s++)
+    totalGlow += ltPathRowGlow(p, base + 3 + s, spiderProg, subCoreR, 0.0) * 0.44;
 
   return getLightningColor(boltSeed) * totalGlow * flashBright;
 }
 
-// sdfQuality: 0 Fast / 1 Balanced / 2 Full — arms only when Full.
+// sdfQuality: 0 Fast / 1 Balanced / 2 Full — arms only when Full (decided in the path pass).
 vec3 displayCGLightning(vec2 sampleUV, vec2 lightningPos, float T, float boltSeed, float lodReduced, float sdfQuality)
 {
   const float mainCoreR   = 0.00045;
   const float branchCoreR = 0.000375;
   const float armCoreR    = branchCoreR * 0.85;
   const float armSubCoreR = branchCoreR * 0.55;
-  const int   MAIN_MAX    = 48;
-  const int   SIDE_MAX    = 24;
-  const int   ARM_MAX     = 40;
-  const int   ASUB_MAX    = 16;
 
   float spiderProg  = clamp(T, 0.0, 1.0);
   float flashBright = T < 1.0
@@ -622,224 +578,16 @@ vec3 displayCGLightning(vec2 sampleUV, vec2 lightningPos, float T, float boltSee
   // Look sliders applied after HDR tonemap in main (pre-tonemap multiply is crushed).
   if (flashBright < 0.0001) return vec3(0.0);
 
-  bool reduced = lodReduced > 0.5;
-  bool drawArms = sdfQuality > 1.5;
-  int mainSegs = reduced ? 24 : 48;
-  int sideSegs = reduced ? 12 : 24;
-  int armSegs  = reduced ? 20 : 40;
-  int asubSegs = reduced ? 8 : 16;
-  int nSides   = reduced ? 3 : 4;
-  int nArms    = drawArms ? (reduced ? 1 : 2) : 0;
-  int nAsubs   = drawArms ? (reduced ? 1 : 2) : 0;
+  int base = lodReduced > 0.5 ? 12 : 0;
+  vec2 p = vec2(sampleUV.x * aspectRatios[0], sampleUV.y);
 
-  vec2  p       = vec2(sampleUV.x * aspectRatios[0], sampleUV.y);
-  vec2  origin  = vec2(lightningPos.x * aspectRatios[0], lightningPos.y);
-
-  // Ground contact under a UV column. Prefer walk-down: VERT_DISTANCE is int8
-  // (±127) and saturates for tall storms, which left CGs floating mid-air.
-  // Initial tip estimate under the strike origin (budget length for the zigzag).
-  float tipY = 0.0;
-  {
-    float xUV = clamp(lightningPos.x, 0.001, 0.999);
-    float yWalk = lightningPos.y;
-    // Cover full column height regardless of sim resolution (VERT_DISTANCE saturates at 127).
-    float step = max(texelSize.y * 2.0, lightningPos.y / 64.0);
-    tipY = 0.0;
-    bool hit = false;
-    for (int k = 0; k < 80; k++) {
-      yWalk -= step;
-      if (yWalk <= 0.0) { tipY = 0.0; hit = true; break; }
-      ivec4 w = texture(wallTex, vec2(xUV, clamp(yWalk, 0.001, 0.999)));
-      if (w[DISTANCE] == 0) {
-        // Sit in the air cell above the wall sample so the tip kisses the surface.
-        tipY = max(yWalk + texelSize.y, 0.0);
-        hit = true;
-        break;
-      }
-    }
-    if (!hit) {
-      // Fallback if walk never found wall (open bottom / ocean column).
-      ivec4 wallAtOrigin = texture(wallTex, clamp(lightningPos, vec2(0.001), vec2(0.999)));
-      int vd = wallAtOrigin[VERT_DISTANCE];
-      if (wallAtOrigin[DISTANCE] == 0)
-        tipY = max(lightningPos.y, 0.0);
-      else if (vd > 0)
-        tipY = max(lightningPos.y - float(vd) * texelSize.y + texelSize.y, 0.0);
-    }
-  }
-  float reach = max(origin.y - tipY, 0.02);
-  // Budget extra length so zigzags still reach; final remap guarantees contact.
-  float stepLen = (reach / float(mainSegs)) / 0.72;
-
-  float totalGlow = 0.0;
-
-  vec2  cgVerts[49];
-  cgVerts[0] = origin;
-  float cgAng = -PI * 0.5;
-
-  for (int i = 0; i < MAIN_MAX; i++) {
-    if (i >= mainSegs) break;
-    float r1 = random2d(vec2(boltSeed * 0.00371 + float(i) * 0.0937, boltSeed * 0.00591 + float(i) * 0.0517));
-    cgAng += (r1 - 0.5) * 1.45;
-    cgAng -= (cgAng + PI * 0.5) * 0.38;
-    // Strong downward bias so the trunk prefers the ground
-    cgAng = mix(cgAng, -PI * 0.5, 0.22);
-    cgVerts[i + 1] = cgVerts[i] + vec2(cos(cgAng), sin(cgAng)) * stepLen;
-  }
-
-  // Re-resolve ground under the built tip column (terrain may differ from origin X),
-  // then stretch / compress so the tip lands on that surface.
-  {
-    // Pull tip X toward the origin column so contact stays under the flash column.
-    cgVerts[mainSegs].x = mix(cgVerts[mainSegs].x, origin.x, 0.40);
-    float tipXUV = clamp(cgVerts[mainSegs].x / max(aspectRatios[0], 1e-4), 0.001, 0.999);
-    float yWalk = max(cgVerts[mainSegs].y, lightningPos.y);
-    float step = max(texelSize.y * 2.0, yWalk / 64.0);
-    float tipAtCol = tipY;
-    bool hit = false;
-    for (int k = 0; k < 80; k++) {
-      yWalk -= step;
-      if (yWalk <= 0.0) { tipAtCol = 0.0; hit = true; break; }
-      ivec4 w = texture(wallTex, vec2(tipXUV, clamp(yWalk, 0.001, 0.999)));
-      if (w[DISTANCE] == 0) {
-        tipAtCol = max(yWalk + texelSize.y, 0.0);
-        hit = true;
-        break;
-      }
-    }
-    if (hit)
-      tipY = tipAtCol;
-
-    float tipBuilt = cgVerts[mainSegs].y;
-    float spanOrig = max(origin.y - tipBuilt, 1e-4);
-    float spanNeed = max(origin.y - tipY, 1e-4);
-    float yScale = spanNeed / spanOrig;
-    for (int i = 1; i <= MAIN_MAX; i++) {
-      if (i > mainSegs) break;
-      cgVerts[i].y = origin.y - (origin.y - cgVerts[i].y) * yScale;
-    }
-    cgVerts[mainSegs].y = tipY;
-  }
-
-  {
-    float minD = 1e10, minFade = 0.0;
-    for (int i = 0; i < MAIN_MAX; i++) {
-      if (i >= mainSegs) break;
-      float t0   = float(i) / float(mainSegs);
-      float fade = clamp((spiderProg - t0) * float(mainSegs), 0.0, 1.0);
-      float d    = spiderSegSDF(p, cgVerts[i], cgVerts[i + 1]);
-      if (d < minD) { minD = d; minFade = fade; }
-      if (minD < mainCoreR * 0.5) break;
-    }
-    totalGlow += segGlow(minD, mainCoreR) * minFade;
-  }
-
-  vec2 sbVerts[25];
-  for (int sb = 0; sb < 4; sb++) {
-    if (sb >= nSides) break;
-    float sbs     = boltSeed + float(sb) * 137.51 + 500.0;
-    int   fromIdx = min(int(random2d(vec2(sbs * 0.00113, sbs * 0.00173)) * float(mainSegs - 4)) + 2, mainSegs - 2);
-
-    float branchLen = random2d(vec2(sbs * 0.00217, sbs * 0.00319)) * 0.20 + 0.05;
-    float sbStep    = reach * branchLen / float(sideSegs);
-    float sbAng     = -PI * 0.5 + (random2d(vec2(sbs * 0.00411, sbs * 0.00591)) - 0.5) * PI * 1.6;
-    sbVerts[0]      = cgVerts[fromIdx];
-
-    for (int i = 0; i < SIDE_MAX; i++) {
-      if (i >= sideSegs) break;
-      float r1 = random2d(vec2(sbs * 0.00511 + float(i) * 0.0937, sbs * 0.00391 + float(i) * 0.0711));
-      sbAng += (r1 - 0.5) * 1.6;
-      sbAng -= (sbAng + PI * 0.5) * 0.30;
-      sbVerts[i + 1] = sbVerts[i] + vec2(cos(sbAng), sin(sbAng)) * sbStep;
-      if (sbVerts[i + 1].y < tipY)
-        sbVerts[i + 1].y = tipY;
-    }
-
-    float sbMinD = 1e10, sbMinFade = 0.0;
-    for (int i = 0; i < SIDE_MAX; i++) {
-      if (i >= sideSegs) break;
-      float t0   = float(i) / float(sideSegs);
-      float fade = clamp((spiderProg - t0) * float(sideSegs), 0.0, 1.0);
-      float d    = spiderSegSDF(p, sbVerts[i], sbVerts[i + 1]);
-      if (d < sbMinD) { sbMinD = d; sbMinFade = fade * (1.0 - t0 * 0.55); }
-      if (sbMinD < branchCoreR * 0.5) break;
-    }
-    totalGlow += segGlow(sbMinD, branchCoreR) * sbMinFade * 0.50;
-  }
-
-  vec2 armVerts[41];
-  vec2 asubVerts[17];
-  for (int ca = 0; ca < 2; ca++) {
-    if (ca >= nArms) break;
-    float cas   = boltSeed + float(ca) * 137.51 + 1000.0;
-    int   caIdx = min(int(random2d(vec2(cas * 0.00113, cas * 0.00173)) * 6.0), min(5, mainSegs - 1));
-
-    float goRight = random2d(vec2(cas * 0.00317, cas * 0.00419)) > 0.5 ? 1.0 : -1.0;
-    float ccAng   = goRight > 0.0 ? 0.0 : PI;
-    ccAng += (random2d(vec2(cas * 0.00513, cas * 0.00217)) - 0.5) * 0.4;
-
-    float armAng = ccAng;
-    armVerts[0]  = cgVerts[caIdx];
-    float armStep = 0.013 * (40.0 / float(armSegs));
-
-    for (int i = 0; i < ARM_MAX; i++) {
-      if (i >= armSegs) break;
-      float r1 = random2d(vec2(cas * 0.00371 + float(i) * 0.0937, cas * 0.00591 + float(i) * 0.0517));
-      armAng += (r1 - 0.5) * 2.5;
-      armAng -= (armAng - ccAng) * 0.12;
-      armAng -= sin(armAng) * 0.28;
-      armVerts[i + 1] = armVerts[i] + vec2(cos(armAng), sin(armAng)) * armStep;
-    }
-
-    vec2  armTip     = armVerts[armSegs];
-    vec2  armTipTC   = vec2(armTip.x / aspectRatios[0], clamp(armTip.y, 0.0, 1.0));
-    float cloudAtArm = texture(waterTex, armTipTC)[CLOUD];
-    if (cloudAtArm >= 0.008) {
-      float armMinD = 1e10, armMinFade = 0.0;
-      for (int i = 0; i < ARM_MAX; i++) {
-        if (i >= armSegs) break;
-        float t0   = float(i) / float(armSegs);
-        float fade = clamp((spiderProg - t0) * float(armSegs), 0.0, 1.0);
-        float d    = spiderSegSDF(p, armVerts[i], armVerts[i + 1]);
-        if (d < armMinD) { armMinD = d; armMinFade = fade; }
-        if (armMinD < armCoreR * 0.5) break;
-      }
-      totalGlow += segGlow(armMinD, armCoreR) * armMinFade * 0.65;
-
-      for (int as = 0; as < 2; as++) {
-        if (as >= nAsubs) break;
-        float ass       = cas + float(as) * 73.37;
-        int   aspawnIdx = min(int(random2d(vec2(ass * 0.00413, ass * 0.00237)) * float(armSegs - 5)) + 2, armSegs - 1);
-        float asubAng   = ccAng;
-        asubVerts[0]    = armVerts[aspawnIdx];
-
-        for (int i = 0; i < ASUB_MAX; i++) {
-          if (i >= asubSegs) break;
-          float r1 = random2d(vec2(ass * 0.00511 + float(i) * 0.0937, ass * 0.00391 + float(i) * 0.0711));
-          asubAng += (r1 - 0.5) * 2.5;
-          asubAng -= (asubAng - ccAng) * 0.12;
-          asubAng -= sin(asubAng) * 0.28;
-          asubVerts[i + 1] = asubVerts[i] + vec2(cos(asubAng), sin(asubAng)) * armStep;
-        }
-
-        vec2  asubTip     = asubVerts[asubSegs];
-        vec2  asubTipTC   = vec2(asubTip.x / aspectRatios[0], clamp(asubTip.y, 0.0, 1.0));
-        float cloudAtAsub = texture(waterTex, asubTipTC)[CLOUD];
-        if (cloudAtAsub >= 0.008) {
-          float asubMinD = 1e10, asubMinFade = 0.0;
-          for (int i = 0; i < ASUB_MAX; i++) {
-            if (i >= asubSegs) break;
-            float t0   = float(i) / float(asubSegs);
-            float fade = clamp((spiderProg - t0) * float(asubSegs), 0.0, 1.0);
-            float d    = spiderSegSDF(p, asubVerts[i], asubVerts[i + 1]);
-            if (d < asubMinD) { asubMinD = d; asubMinFade = fade; }
-            if (asubMinD < armSubCoreR * 0.5) break;
-          }
-          totalGlow += segGlow(asubMinD, armSubCoreR) * asubMinFade * 0.30;
-        }
-      }
-    }
-  }
+  float totalGlow = ltPathRowGlow(p, base, spiderProg, mainCoreR, 0.0);
+  for (int sb = 0; sb < 4; sb++)
+    totalGlow += ltPathRowGlow(p, base + 1 + sb, spiderProg, branchCoreR, 0.55) * 0.50;
+  for (int ca = 0; ca < 2; ca++)
+    totalGlow += ltPathRowGlow(p, base + 5 + ca, spiderProg, armCoreR, 0.0) * 0.65;
+  for (int as = 0; as < 4; as++)
+    totalGlow += ltPathRowGlow(p, base + 7 + as, spiderProg, armSubCoreR, 0.0) * 0.30;
 
   return getLightningColor(boltSeed) * totalGlow * flashBright;
 }

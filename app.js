@@ -6210,6 +6210,10 @@ function createLightningIllumFBOs(scaleIn)
 {
   if (!sim_res_x || !sim_res_y)
     return;
+  // The FBO illumination pass is disabled (no program is linked), so nothing ever renders into
+  // or samples these six sim-resolution RGBA16F targets — don't spend VRAM on them.
+  if (!lightningIllumProgram)
+    return;
 
   const scale = clamp(scaleIn != null ? scaleIn : 1.0, 0.25, 1.0);
   const w = Math.max(2, Math.round(sim_res_x * scale));
@@ -23165,6 +23169,8 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   let lightningIllumShader = null;
 
   const lightningLocationShader = await loadShader('lightningLocationShader.frag');
+  // Builds the Enhanced SDF bolt polylines once per frame (was rebuilt in every pixel).
+  const lightningBoltPathShader = await loadShader('lightningBoltPathShader.frag');
 
   const setupShader = await loadShader('setupShader.frag');
   const setupHeightShader = await loadShader('setupHeight.frag');
@@ -23229,6 +23235,12 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   const lightingProgram = createProgram(simVertexShader, lightingShader);
   lightningIllumProgram = null;
   const lightningLocationProgram = createProgram(simVertexShader, lightningLocationShader);
+  let lightningBoltPathProgram = null;
+  try {
+    lightningBoltPathProgram = createProgram(simVertexShader, lightningBoltPathShader);
+  } catch (e) {
+    console.warn('Lightning bolt path pre-pass unavailable; SDF bolts will not be drawn.', e);
+  }
   const setupProgram = createProgram(simVertexShader, setupShader);
   const setupHeightProgram = createProgram(simVertexShader, setupHeightShader);
   const sculptTerrainProgram = createProgram(simVertexShader, sculptTerrainShader);
@@ -23777,6 +23789,10 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   const precipitationFeedbackTexture = gl.createTexture();
   const precipitationDepositionTexture = gl.createTexture();
   const lightningDataTexture = gl.createTexture();
+  const LT_BOLT_PATH_TEX_W = 64;
+  const LT_BOLT_PATH_TEX_H = 48;
+  const lightningBoltPathTexture = gl.createTexture();
+  const lightningBoltPathFrameBuff = gl.createFramebuffer();
   radarTexture = gl.createTexture();
 
   // Cache textures for radar display (to freeze all input textures)
@@ -24256,6 +24272,19 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, lightningDataFrameBuff);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, lightningDataTexture, 0);
+
+  // Prebuilt SDF bolt polylines (lightningBoltPathShader.frag): 64 x 48 RGBA32F, one row per
+  // polyline, read with texelFetch by the realistic display shader on unit 11.
+  gl.bindTexture(gl.TEXTURE_2D, lightningBoltPathTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, LT_BOLT_PATH_TEX_W, LT_BOLT_PATH_TEX_H, 0, gl.RGBA, gl.FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, lightningBoltPathFrameBuff);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, lightningBoltPathTexture, 0);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
   // Create a procedural lightning bolt texture for the V2 shader.
   const lightningTextureWidth = 512;
   const lightningTextureHeight = 1024;
@@ -27383,7 +27412,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'lightningTex'), 7);
   gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'lightningDataTex'), 8);
   gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'ambientLightTex'), 9);
-  gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'lightningOnLightTex'), 11);
+  gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'ltBoltPathTex'), 11);
   gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'lightningCloudFlashTex'), 12);
   gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'lightningSurfFlashTex'), 13);
   gl.uniform1i(gl.getUniformLocation(realisticDisplayProgram, 'sunColumnTex'), 14);
@@ -27415,6 +27444,20 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     gl.uniform2f(gl.getUniformLocation(lightningIllumProgram, 'texelSize'), texelSizeX, texelSizeY);
     gl.uniform2f(gl.getUniformLocation(lightningIllumProgram, 'aspectRatios'), sim_aspect, canvas.width / Math.max(canvas.height, 1));
   }
+
+  if (lightningBoltPathProgram) {
+    gl.useProgram(lightningBoltPathProgram);
+    gl.uniform1i(gl.getUniformLocation(lightningBoltPathProgram, 'waterTex'), 0);
+    gl.uniform1i(gl.getUniformLocation(lightningBoltPathProgram, 'wallTex'), 1);
+    gl.uniform1i(gl.getUniformLocation(lightningBoltPathProgram, 'lightningDataTex'), 2);
+    gl.uniform2f(gl.getUniformLocation(lightningBoltPathProgram, 'resolution'), sim_res_x, sim_res_y);
+    gl.uniform2f(gl.getUniformLocation(lightningBoltPathProgram, 'texelSize'), texelSizeX, texelSizeY);
+    gl.uniform1f(gl.getUniformLocation(lightningBoltPathProgram, 'dryLapse'), dryLapse);
+  }
+  const uloc_boltPath_aspectRatios = lightningBoltPathProgram
+    ? gl.getUniformLocation(lightningBoltPathProgram, 'aspectRatios') : null;
+  const uloc_boltPath_ltSdfQuality = lightningBoltPathProgram
+    ? gl.getUniformLocation(lightningBoltPathProgram, 'ltSdfQuality') : null;
 
   gl.useProgram(lightningLocationProgram);
   gl.uniform1i(gl.getUniformLocation(lightningLocationProgram, 'precipFeedbackTex'), 0);
@@ -30766,14 +30809,50 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
+  function getLtSdfQualityValue()
+  {
+    const sdfQualityName = guiControls.ltSdfQuality || 'Balanced';
+    return sdfQualityName === 'Full' ? 2 : (sdfQualityName === 'Fast' ? 0 : 1);
+  }
+
+  // Build the Enhanced SDF bolt polylines for the current strike into lightningBoltPathTexture
+  // (64 x 48 fragments). The realistic display shader then only measures distances to them,
+  // instead of re-running the random walk + terrain searches in every pixel near the strike.
+  function updateLightningBoltPathTexture()
+  {
+    if (!lightningBoltPathProgram)
+      return;
+    if (guiControls.enableLightning === false || guiControls.ltDrawSdfBolts === false)
+      return; // realistic shader skips bolts entirely, so the texture is never read
+    // Strike data must be current before the polylines are built from it.
+    syncProceduralStrikeToLightningDataTexture();
+    gl.disable(gl.BLEND);
+    gl.useProgram(lightningBoltPathProgram);
+    if (uloc_boltPath_aspectRatios)
+      gl.uniform2f(uloc_boltPath_aspectRatios, sim_aspect, canvas_aspect);
+    if (uloc_boltPath_ltSdfQuality)
+      gl.uniform1f(uloc_boltPath_ltSdfQuality, getLtSdfQualityValue());
+    gl.bindVertexArray(fluidVao);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, lightningBoltPathFrameBuff);
+    gl.viewport(0, 0, LT_BOLT_PATH_TEX_W, LT_BOLT_PATH_TEX_H);
+    gl.drawBuffers([ gl.COLOR_ATTACHMENT0 ]);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, waterTexture_1);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, wallTexture_1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, lightningDataTexture);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
   function uploadProceduralLightningUniforms()
   {
     if (uloc_real_ltUseLegacyStyle)
       gl.uniform1i(uloc_real_ltUseLegacyStyle, 0);
 
     // Always upload SDF visibility + look uniforms (WebGL defaults to 0 → invisible/flat bolts).
-    const sdfQualityName = guiControls.ltSdfQuality || 'Balanced';
-    const sdfQualityVal = sdfQualityName === 'Full' ? 2 : (sdfQualityName === 'Fast' ? 0 : 1);
+    const sdfQualityVal = getLtSdfQualityValue();
     const drawBoltsVal = (guiControls.ltDrawSdfBolts !== false && guiControls.enableLightning !== false) ? 1 : 0;
     const enableLtVal = guiControls.enableLightning !== false ? 1 : 0;
     if (uloc_real_ltSdfQuality)
@@ -34186,6 +34265,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       const hdrH = hdrFBO.height;
 
       updateLightningIlluminationTexture();
+      updateLightningBoltPathTexture();
 
       { // Ambient bounce from reflected light — keep last frame while paused
         if (needsAmbientLightBlur()
@@ -34357,7 +34437,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
 
       // draw clouds and terrain
       gl.activeTexture(gl.TEXTURE11);
-      gl.bindTexture(gl.TEXTURE_2D, lightningOnLightTex);
+      gl.bindTexture(gl.TEXTURE_2D, lightningBoltPathTexture);
       gl.activeTexture(gl.TEXTURE12);
       gl.bindTexture(gl.TEXTURE_2D,
         getLightningFlashIllumTexture(lightningCloudFlashTex, lightningCloudFlashBlurFBO));
