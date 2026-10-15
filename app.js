@@ -313,6 +313,96 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
 var canvas;
+
+// --- Render pixel ratio ------------------------------------------------------------------
+// The main canvas renders at (CSS size x pixel ratio). < 1 renders fewer pixels (faster,
+// softer), > 1 renders extra pixels (sharper on HiDPI screens, slower). Device setting, kept
+// in localStorage rather than in simulation saves.
+//
+// installCanvasPixelRatio() makes canvas.width / canvas.height on the main canvas report
+// and accept *CSS (logical) pixels* — the unit all mouse, camera, overlay and 2D-canvas math
+// in this file was written in — while the real drawing buffer is sized CSS x pixel ratio.
+// Code that sizes GPU render targets or viewports must use gl.drawingBufferWidth/Height
+// (see getCanvasBackingWidth/Height).
+const PIXEL_RATIO_STORAGE_KEY = 'weatherSandbox.pixelRatio';
+const PIXEL_RATIO_MIN = 0.25;
+var displaySettings = { pixelRatio : 1.0 };
+
+function getMaxPixelRatio()
+{
+  return Math.min(3, Math.max(2, window.devicePixelRatio || 1));
+}
+
+function clampPixelRatio(value)
+{
+  const v = Number(value);
+  if (!Number.isFinite(v))
+    return 1.0;
+  return Math.min(getMaxPixelRatio(), Math.max(PIXEL_RATIO_MIN, Math.round(v * 100) / 100));
+}
+
+function loadStoredPixelRatio()
+{
+  try {
+    const raw = localStorage.getItem(PIXEL_RATIO_STORAGE_KEY);
+    if (raw != null)
+      displaySettings.pixelRatio = clampPixelRatio(parseFloat(raw));
+  } catch (e) { /* storage unavailable: keep default */ }
+  return displaySettings.pixelRatio;
+}
+
+function storePixelRatio()
+{
+  try {
+    localStorage.setItem(PIXEL_RATIO_STORAGE_KEY, String(displaySettings.pixelRatio));
+  } catch (e) { /* ignore */ }
+}
+
+function installCanvasPixelRatio(cv)
+{
+  if (!cv || cv._pixelRatioInstalled)
+    return;
+  const proto = HTMLCanvasElement.prototype;
+  const wDesc = Object.getOwnPropertyDescriptor(proto, 'width');
+  const hDesc = Object.getOwnPropertyDescriptor(proto, 'height');
+  let logicalW = wDesc.get.call(cv);
+  let logicalH = hDesc.get.call(cv);
+  const applyBacking = () => {
+    const pr = displaySettings.pixelRatio;
+    const bw = Math.max(1, Math.round(logicalW * pr));
+    const bh = Math.max(1, Math.round(logicalH * pr));
+    // Re-assigning an unchanged size still reallocates (and clears) the drawing buffer.
+    if (wDesc.get.call(cv) !== bw)
+      wDesc.set.call(cv, bw);
+    if (hDesc.get.call(cv) !== bh)
+      hDesc.set.call(cv, bh);
+    cv.style.width = logicalW + 'px';
+    cv.style.height = logicalH + 'px';
+  };
+  Object.defineProperty(cv, 'width', {
+    configurable : true,
+    get : () => logicalW,
+    set : (v) => { logicalW = Math.max(1, Math.round(Number(v) || 1)); applyBacking(); },
+  });
+  Object.defineProperty(cv, 'height', {
+    configurable : true,
+    get : () => logicalH,
+    set : (v) => { logicalH = Math.max(1, Math.round(Number(v) || 1)); applyBacking(); },
+  });
+  cv._applyPixelRatio = applyBacking;
+  cv._pixelRatioInstalled = true;
+  applyBacking();
+}
+
+function getCanvasBackingWidth()
+{
+  return (typeof gl !== 'undefined' && gl) ? gl.drawingBufferWidth : canvas.width;
+}
+
+function getCanvasBackingHeight()
+{
+  return (typeof gl !== 'undefined' && gl) ? gl.drawingBufferHeight : canvas.height;
+}
 var gl;
 
 var clockEl;
@@ -2186,7 +2276,8 @@ function frameProfilerCollectBootInfo()
     info.hdr = (typeof hdrRenderScaleState === 'number' ? hdrRenderScaleState : 1);
     info.lite = (typeof useLiteVisualsMode === 'function' && useLiteVisualsMode()) || false;
     info.hiResPerf = !!guiControls.highResPerformanceMode;
-    info.canvas = canvas.width + 'x' + canvas.height;
+    info.canvas = canvas.width + 'x' + canvas.height
+      + (displaySettings.pixelRatio !== 1 ? ' @' + displaySettings.pixelRatio + 'x' : '');
     info.displayMode = guiControls.displayMode;
   } catch (e) { /* optional */ }
   return info;
@@ -6185,8 +6276,8 @@ function disposeFBOList(list)
 function getHdrRenderDimensions()
 {
   return {
-    w: Math.max(2, Math.round(canvas.width * hdrRenderScaleState)),
-    h: Math.max(2, Math.round(canvas.height * hdrRenderScaleState))
+    w: Math.max(2, Math.round(getCanvasBackingWidth() * hdrRenderScaleState)),
+    h: Math.max(2, Math.round(getCanvasBackingHeight() * hdrRenderScaleState))
   };
 }
 
@@ -14004,6 +14095,8 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
   document.body.style.overflow = 'hidden'; // prevent scrolling bar from apearing
 
   canvas = document.getElementById('mainCanvas');
+  loadStoredPixelRatio();
+  installCanvasPixelRatio(canvas);
   nukeOverlayCanvas = document.createElement('canvas');
   nukeOverlayCanvas.id = 'nukeOverlayCanvas';
   nukeOverlayCanvas.style.position = 'fixed';
@@ -15287,6 +15380,17 @@ async function mainScript(initialBaseTex, initialWaterTex, initialWallTex, initi
       .add(guiControls, 'displayMode', displayModeOptions)
       .name('Display Mode')
       .listen();
+
+    // Render resolution multiplier (device setting, stored in localStorage).
+    {
+      const prCtrl = display_folder.add(displaySettings, 'pixelRatio', PIXEL_RATIO_MIN, getMaxPixelRatio(), 0.05)
+        .name('Pixel Ratio');
+      prCtrl.onFinishChange(function(value) { setDisplayPixelRatio(value); });
+      if (prCtrl.domElement && prCtrl.domElement.parentElement)
+        prCtrl.domElement.parentElement.title = 'Render resolution relative to the window size. '
+          + 'Lower = faster but softer, higher = sharper but slower. '
+          + 'Your screen\'s native ratio is ' + (window.devicePixelRatio || 1) + '.';
+    }
 
     var displayCamera = display_folder.addFolder('Camera');
     displayCamera.add(guiControls, 'cameraMode', {
@@ -21239,8 +21343,12 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     canvas_aspect = canvas.width / canvas.height;
 
     soundingGraph.resizeCanvas();
+    onCanvasBackingResized();
+  });
 
-    // Render output framebuffers need to match canvas resolution
+  // Render targets that track the drawing-buffer size (window resize, pixel ratio change).
+  function onCanvasBackingResized()
+  {
     hdrRenderScaleState = 1.0;
     createBloomFBOs(); // recreate bloom framebuffers
     createHdrFBO();    // recreate hdr framebuffer
@@ -21248,11 +21356,25 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     // Recreate radar cache texture at new screen size
     if (radarTexture) {
       gl.bindTexture(gl.TEXTURE_2D, radarTexture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, getCanvasBackingWidth(), getCanvasBackingHeight(), 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     }
 
     updateNukeOverlaySize();
-  });
+  }
+
+  function setDisplayPixelRatio(value)
+  {
+    const pr = clampPixelRatio(value);
+    displaySettings.pixelRatio = pr;
+    storePixelRatio();
+    if (!canvas || !canvas._applyPixelRatio)
+      return;
+    const prevW = getCanvasBackingWidth();
+    const prevH = getCanvasBackingHeight();
+    canvas._applyPixelRatio();
+    if (getCanvasBackingWidth() !== prevW || getCanvasBackingHeight() !== prevH)
+      onCanvasBackingResized();
+  }
 
   function updateNukeOverlaySize()
   {
@@ -22692,7 +22814,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   {
     if (guiControls.performanceAutoScaling === false)
       return 1.0;
-    const pixels = canvas.width * canvas.height;
+    const pixels = getCanvasBackingWidth() * getCanvasBackingHeight();
     let scale = 1.0;
     if (pixels > 1920 * 1080)
       scale = 0.75;
@@ -22860,7 +22982,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     if (!guiControls.enableBloom)
       return 0;
     const pressure = getFramePressure();
-    const pixels = canvas.width * canvas.height;
+    const pixels = getCanvasBackingWidth() * getCanvasBackingHeight();
     const zoomNorm = cam.curZoom / Math.max(sim_res_x, 1);
     let cap = 7;
     if (pixels > 1920 * 1080)
@@ -22975,7 +23097,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
           // Recreate radar cache texture at new screen size
           if (radarTexture) {
             gl.bindTexture(gl.TEXTURE_2D, radarTexture);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, getCanvasBackingWidth(), getCanvasBackingHeight(), 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
           }
           updateNukeOverlaySize();
 
@@ -22998,7 +23120,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       createHdrFBO();
       if (radarTexture) {
         gl.bindTexture(gl.TEXTURE_2D, radarTexture);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, getCanvasBackingWidth(), getCanvasBackingHeight(), 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       }
       updateNukeOverlaySize();
 
@@ -24371,7 +24493,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 
   gl.bindTexture(gl.TEXTURE_2D, radarTexture);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, getCanvasBackingWidth(), getCanvasBackingHeight(), 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
@@ -31412,7 +31534,9 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
 
     if (mem)
       leftLines.push('Mem: ' + mem);
-    leftLines.push('Canvas: ' + canvas.width + 'x' + canvas.height);
+    leftLines.push('Canvas: ' + canvas.width + 'x' + canvas.height
+      + ' (render ' + getCanvasBackingWidth() + 'x' + getCanvasBackingHeight()
+      + ' @ ' + displaySettings.pixelRatio + 'x)');
 
     const rightLines = [
       'xyz: ' + cam.curXpos.toFixed(3) + ' / ' + cam.curYpos.toFixed(3) + ' / ' + cam.curZoom.toFixed(3),
@@ -33486,7 +33610,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       && now - lastUserInputMs > 500
       && camSettled
       && cam.curXpos === st.x && cam.curYpos === st.y && cam.curZoom === st.zoom
-      && canvas.width === st.w && canvas.height === st.h
+      && getCanvasBackingWidth() === st.w && getCanvasBackingHeight() === st.h
       && guiControls.displayMode === st.mode
       && st.skipped < 3;
     if (canSkip) {
@@ -33497,8 +33621,8 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     st.x = cam.curXpos;
     st.y = cam.curYpos;
     st.zoom = cam.curZoom;
-    st.w = canvas.width;
-    st.h = canvas.height;
+    st.w = getCanvasBackingWidth();
+    st.h = getCanvasBackingHeight();
     st.mode = guiControls.displayMode;
     return false;
   }
@@ -34320,7 +34444,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
     fpPhaseT = performance.now();
     gl.useProgram(realisticDisplayProgram);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null); // null is canvas
-    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.viewport(0, 0, getCanvasBackingWidth(), getCanvasBackingHeight());
     gl.clearColor(0.0, 0.0, 0.0, 1.0);        // background color
     gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -34664,7 +34788,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
       }
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null); // null is canvas
-      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.viewport(0, 0, getCanvasBackingWidth(), getCanvasBackingHeight());
       gl.clearColor(0.0, 0.0, 0.0, 1.0);        // background color
       gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -35162,7 +35286,7 @@ function drawSkewWindBarb(ctx, stemX, y, uMs, vMs)
         updateRadarDisplayCache();
 
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.viewport(0, 0, getCanvasBackingWidth(), getCanvasBackingHeight());
         gl.clearColor(0.0, 0.0, 0.0, 0.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
         gl.bindVertexArray(fluidVao);
